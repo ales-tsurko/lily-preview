@@ -832,6 +832,9 @@ impl Lilypalooza {
                         Some(PromptOkAction::ReloadEditorTab(tab_id)) => {
                             self.reload_editor_tab_from_disk(tab_id)
                         }
+                        Some(PromptOkAction::RemoveBus(bus_id)) => {
+                            self.remove_bus_confirmed(bus_id)
+                        }
                         Some(PromptOkAction::DeleteBrowserPath(path)) => {
                             match self.delete_browser_path_with_history(&path) {
                                 Ok(task) => task,

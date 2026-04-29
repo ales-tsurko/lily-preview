@@ -1249,6 +1249,7 @@ enum PromptOkAction {
     ClearLogs,
     ReloadEditorTab(u64),
     DeleteBrowserPath(PathBuf),
+    RemoveBus(u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

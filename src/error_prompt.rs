@@ -86,6 +86,11 @@ impl ErrorPrompt {
         self.buttons
     }
 
+    #[cfg(test)]
+    pub(crate) fn title(&self) -> &str {
+        &self.title
+    }
+
     pub(crate) fn overlay_ok<'a, Message>(
         &'a self,
         selected: PromptSelectedButton,

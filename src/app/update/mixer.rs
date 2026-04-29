@@ -62,6 +62,63 @@ impl Lilypalooza {
         Task::batch(tasks)
     }
 
+    pub(in crate::app) fn request_remove_bus_confirmation(&mut self, id: u16) -> Task<Message> {
+        let name = self
+            .playback
+            .as_ref()
+            .and_then(|playback| playback.mixer_state().bus(BusId(id)).ok())
+            .map(|bus| bus.name.clone())
+            .unwrap_or_else(|| format!("Bus {id}"));
+        self.show_prompt(
+            ErrorPrompt::new(
+                format!("Remove {name}?"),
+                "This removes the bus and clears routes or sends that target it.",
+                ErrorFatality::Recoverable,
+                PromptButtons::OkCancel,
+            ),
+            Some(PromptOkAction::RemoveBus(id)),
+        );
+        Task::none()
+    }
+
+    pub(in crate::app) fn remove_bus_confirmed(&mut self, id: u16) -> Task<Message> {
+        self.remove_bus(id, true)
+    }
+
+    fn remove_bus(&mut self, id: u16, confirmed: bool) -> Task<Message> {
+        if !confirmed {
+            return self.request_remove_bus_confirmation(id);
+        }
+
+        let mut editor_cleanup = Task::none();
+        let removed_bus_strip_index = self.playback.as_ref().and_then(|playback| {
+            playback
+                .mixer_state()
+                .buses()
+                .iter()
+                .position(|bus| bus.bus_id == Some(BusId(id)))
+                .map(|index| 1 + playback.mixer_state().track_count() + index)
+        });
+        if let Some(strip_index) = removed_bus_strip_index {
+            editor_cleanup = Task::batch([
+                editor_cleanup,
+                self.destroy_editor_strip_and_shift_later(strip_index),
+            ]);
+        }
+
+        let Some(playback) = self.playback.as_mut() else {
+            return editor_cleanup;
+        };
+        let mut mixer = playback.mixer();
+        if let Err(error) = mixer.remove_bus(BusId(id)) {
+            self.logger.push(error.to_string());
+        } else {
+            self.piano_roll
+                .set_global_solo_active(mixer_has_any_solo(&mixer));
+        }
+        editor_cleanup
+    }
+
     pub(in crate::app) fn destroy_all_editor_windows(&mut self) -> Task<Message> {
         let removed = self.processor_editor_windows.remove_all_windows();
         if removed.is_empty() {
@@ -480,7 +537,7 @@ impl Lilypalooza {
             self.close_processor_browser();
         }
 
-        let mut editor_cleanup = match &message {
+        let editor_cleanup = match &message {
             MixerMessage::SelectTrackInstrument(index, _) => {
                 self.destroy_editor_target(EditorTarget {
                     strip_index: index + 1,
@@ -491,23 +548,8 @@ impl Lilypalooza {
             _ => Task::none(),
         };
 
-        let removed_bus_strip_index = if let MixerMessage::RemoveBus(id) = &message {
-            self.playback.as_ref().and_then(|playback| {
-                playback
-                    .mixer_state()
-                    .buses()
-                    .iter()
-                    .position(|bus| bus.bus_id == Some(BusId(*id)))
-                    .map(|index| 1 + playback.mixer_state().track_count() + index)
-            })
-        } else {
-            None
-        };
-        if let Some(strip_index) = removed_bus_strip_index {
-            editor_cleanup = Task::batch([
-                editor_cleanup,
-                self.destroy_editor_strip_and_shift_later(strip_index),
-            ]);
+        if let MixerMessage::RemoveBus(id) = message {
+            return Task::batch([editor_cleanup, self.remove_bus(id, false)]);
         }
 
         let Some(playback) = self.playback.as_mut() else {
@@ -525,13 +567,8 @@ impl Lilypalooza {
                         mixer_error = Some(error.to_string());
                     }
                 }
-                MixerMessage::RemoveBus(id) => {
-                    if let Err(error) = mixer.remove_bus(BusId(id)) {
-                        mixer_error = Some(error.to_string());
-                    } else {
-                        self.piano_roll
-                            .set_global_solo_active(mixer_has_any_solo(&mixer));
-                    }
+                MixerMessage::RemoveBus(_) => {
+                    unreachable!("bus removal is handled before mixer borrow")
                 }
                 MixerMessage::InstrumentViewportScrolled(viewport) => {
                     self.mixer_instrument_scroll_x = viewport.absolute_offset().x;
@@ -1344,7 +1381,7 @@ mod tests {
 
     use super::{Lilypalooza, MixerHistoryMode, mixer_message_history_mode};
     use crate::app::RenameTarget;
-    use crate::app::messages::MixerMessage;
+    use crate::app::messages::{MixerMessage, PromptMessage};
     use crate::app::processor_editor_windows::EditorTarget;
     use crate::state::ProjectState;
     use lilypalooza_audio::{
@@ -1542,7 +1579,55 @@ mod tests {
                 .expect("playback should exist")
                 .mixer_state()
                 .bus(BusId(bus_id.0))
+                .is_ok()
+        );
+        assert_eq!(
+            app.error_prompt.as_ref().map(|prompt| prompt.title()),
+            Some("Remove Bus 1?")
+        );
+
+        let _ = app.handle_prompt_message(PromptMessage::Acknowledge);
+
+        assert!(
+            app.playback
+                .as_ref()
+                .expect("playback should exist")
+                .mixer_state()
+                .bus(BusId(bus_id.0))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn canceling_remove_bus_prompt_keeps_bus() {
+        let mut app = test_app();
+        app.playback = Some(
+            AudioEngine::start_cpal(MixerState::new(), AudioEngineOptions::default())
+                .expect("test audio engine should start"),
+        );
+
+        let _ = app.handle_mixer_message(MixerMessage::AddBus);
+        let bus_id = app
+            .playback
+            .as_ref()
+            .expect("playback should exist")
+            .mixer_state()
+            .buses()
+            .first()
+            .and_then(|bus| bus.bus_id)
+            .expect("bus should be added");
+
+        let _ = app.handle_mixer_message(MixerMessage::RemoveBus(bus_id.0));
+        let _ = app.handle_prompt_message(PromptMessage::Cancel);
+
+        assert!(app.error_prompt.is_none());
+        assert!(
+            app.playback
+                .as_ref()
+                .expect("playback should exist")
+                .mixer_state()
+                .bus(BusId(bus_id.0))
+                .is_ok()
         );
     }
 
@@ -1618,7 +1703,7 @@ mod tests {
         );
         attach_recording_editor(&mut app, later_bus_target, Rc::clone(&later_bus_detached));
 
-        let _ = app.handle_mixer_message(MixerMessage::RemoveBus(first_bus_id));
+        let _ = app.remove_bus_confirmed(first_bus_id);
 
         assert_eq!(*track_detached.borrow(), 0);
         assert_eq!(*removed_bus_detached.borrow(), 1);
@@ -2268,7 +2353,7 @@ mod tests {
             crate::app::mixer::RoutingStrip::Track(0),
             bus_id,
         ));
-        let _ = app.handle_mixer_message(MixerMessage::RemoveBus(bus_id));
+        let _ = app.remove_bus_confirmed(bus_id);
 
         let track = app
             .playback
