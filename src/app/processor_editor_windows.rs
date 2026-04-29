@@ -224,6 +224,58 @@ impl EditorWindowManager {
         }
     }
 
+    pub(super) fn move_slot_targets_within_strip(
+        &mut self,
+        strip_index: usize,
+        from_slot_index: usize,
+        to_slot_index: usize,
+    ) {
+        if from_slot_index == to_slot_index {
+            return;
+        }
+
+        let shift = |target: EditorTarget| -> EditorTarget {
+            if target.strip_index != strip_index {
+                return target;
+            }
+            let slot_index = if target.slot_index == from_slot_index {
+                to_slot_index
+            } else if from_slot_index < to_slot_index
+                && target.slot_index > from_slot_index
+                && target.slot_index <= to_slot_index
+            {
+                target.slot_index - 1
+            } else if from_slot_index > to_slot_index
+                && target.slot_index >= to_slot_index
+                && target.slot_index < from_slot_index
+            {
+                target.slot_index + 1
+            } else {
+                target.slot_index
+            };
+            EditorTarget {
+                slot_index,
+                ..target
+            }
+        };
+
+        let moved_windows = self.windows.drain().collect::<Vec<_>>();
+        self.windows_by_id.clear();
+        for (target, window) in moved_windows {
+            let moved = shift(target);
+            self.windows_by_id.insert(window.host_window_id, moved);
+            self.windows.insert(moved, window);
+        }
+
+        for pending in self.pending.values_mut() {
+            pending.target = shift(pending.target);
+        }
+
+        if let Some(target) = self.focused {
+            self.focused = Some(shift(target));
+        }
+    }
+
     pub(super) fn remove_all_windows(&mut self) -> Vec<(window::Id, Box<dyn EditorSession>)> {
         let windows = self
             .windows
@@ -642,5 +694,73 @@ mod tests {
 
         assert!(removed.is_some());
         assert!(!manager.windows.contains_key(&target));
+    }
+
+    #[test]
+    fn processor_editor_window_manager_moves_effect_slot_targets_with_reorder() {
+        let mut manager = EditorWindowManager::default();
+        let targets = [
+            EditorTarget {
+                strip_index: 2,
+                slot_index: 1,
+            },
+            EditorTarget {
+                strip_index: 2,
+                slot_index: 2,
+            },
+            EditorTarget {
+                strip_index: 2,
+                slot_index: 3,
+            },
+        ];
+        for target in targets {
+            let window_id = window::Id::unique();
+            manager.begin_open(
+                target,
+                format!("Slot {}", target.slot_index),
+                true,
+                Box::new(FakeEditorSession),
+                window_id,
+            );
+            manager
+                .attach(
+                    window_id,
+                    None,
+                    EditorParent {
+                        window: iced::window::raw_window_handle::RawWindowHandle::AppKit(
+                            iced::window::raw_window_handle::AppKitWindowHandle::new(
+                                std::ptr::NonNull::<std::ffi::c_void>::dangling(),
+                            ),
+                        ),
+                        display: None,
+                    },
+                )
+                .expect("attach should succeed");
+        }
+
+        manager.move_slot_targets_within_strip(2, 1, 3);
+
+        assert!(manager.windows.contains_key(&EditorTarget {
+            strip_index: 2,
+            slot_index: 1,
+        }));
+        assert!(manager.windows.contains_key(&EditorTarget {
+            strip_index: 2,
+            slot_index: 2,
+        }));
+        assert!(manager.windows.contains_key(&EditorTarget {
+            strip_index: 2,
+            slot_index: 3,
+        }));
+        assert_eq!(
+            manager
+                .windows
+                .get(&EditorTarget {
+                    strip_index: 2,
+                    slot_index: 3,
+                })
+                .map(|window| window.title.as_str()),
+            Some("Slot 1")
+        );
     }
 }

@@ -1038,6 +1038,8 @@ struct Lilypalooza {
     mixer_bus_scroll_x: f32,
     mixer_bus_viewport_width: f32,
     open_mixer_effect_rack_tracks: Vec<usize>,
+    effect_rack_scroll_y: HashMap<usize, f32>,
+    effect_rack_viewport_height: HashMap<usize, f32>,
     editor_tabbar_autoscroll_direction: i8,
     editor_tabbar_drag_pointer_x: Option<f32>,
     pending_reveal_editor_tab: Option<u64>,
@@ -1057,7 +1059,11 @@ struct Lilypalooza {
         processor_editor_windows::EditorTarget,
         mixer::ProcessorSlotSegment,
     )>,
+    effect_rack_hovered_effect: Option<(usize, usize)>,
     effect_drag_source: Option<(usize, usize)>,
+    effect_drag_target: Option<(usize, usize)>,
+    effect_rack_autoscroll_direction: i8,
+    effect_rack_drag_pointer_y: Option<f32>,
     open_instrument_browser_track: Option<usize>,
     instrument_browser_backend: mixer::InstrumentBrowserBackend,
     instrument_browser_search: String,
@@ -1616,6 +1622,8 @@ fn new_with_loaded_state(
         mixer_bus_scroll_x: 0.0,
         mixer_bus_viewport_width: 0.0,
         open_mixer_effect_rack_tracks: Vec::new(),
+        effect_rack_scroll_y: HashMap::new(),
+        effect_rack_viewport_height: HashMap::new(),
         editor_tabbar_autoscroll_direction: 0,
         editor_tabbar_drag_pointer_x: None,
         pending_reveal_editor_tab: None,
@@ -1632,7 +1640,11 @@ fn new_with_loaded_state(
         selected_track_index: None,
         open_processor_browser_target: None,
         hovered_processor_slot: None,
+        effect_rack_hovered_effect: None,
         effect_drag_source: None,
+        effect_drag_target: None,
+        effect_rack_autoscroll_direction: 0,
+        effect_rack_drag_pointer_y: None,
         open_instrument_browser_track: None,
         instrument_browser_backend: mixer::InstrumentBrowserBackend::BuiltIn,
         instrument_browser_search: String::new(),
@@ -1767,6 +1779,11 @@ fn subscription(app: &Lilypalooza) -> Subscription<Message> {
     }
 
     if app.dragged_editor_tab.is_some() {
+        subscriptions
+            .push(iced::time::every(EDITOR_TABBAR_AUTOSCROLL_INTERVAL).map(|_| Message::Tick));
+    }
+
+    if app.effect_drag_source.is_some() && app.effect_rack_autoscroll_direction != 0 {
         subscriptions
             .push(iced::time::every(EDITOR_TABBAR_AUTOSCROLL_INTERVAL).map(|_| Message::Tick));
     }

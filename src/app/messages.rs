@@ -259,6 +259,10 @@ pub(super) enum MixerMessage {
     RemoveBus(u16),
     InstrumentViewportScrolled(iced::widget::scrollable::Viewport),
     BusViewportScrolled(iced::widget::scrollable::Viewport),
+    EffectRackViewportScrolled {
+        strip_index: usize,
+        viewport: iced::widget::scrollable::Viewport,
+    },
     ResetMasterMeter,
     SetMasterGain(f32),
     SetMasterPan(f32),
@@ -314,6 +318,7 @@ pub(super) enum MixerMessage {
         strip_index: usize,
         y: f32,
     },
+    EffectRackCursorLeft(usize),
     MoveTrackEffect {
         strip_index: usize,
         from_effect_index: usize,

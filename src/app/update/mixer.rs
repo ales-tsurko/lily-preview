@@ -284,14 +284,21 @@ impl Lilypalooza {
 
     pub(in crate::app) fn handle_primary_mouse_pressed(&mut self, pressed: bool) -> Task<Message> {
         self.primary_mouse_pressed = pressed;
-        if !pressed {
-            self.commit_pending_mixer_history();
-            if self.renaming_target.is_some() {
-                return iced::widget::operation::is_focused(super::super::TRACK_RENAME_INPUT_ID)
-                    .map(Message::TrackRenameFocusChanged);
-            }
+        if pressed {
+            self.begin_effect_drag_from_hover();
+            return Task::none();
         }
-        Task::none()
+
+        let effect_drag_task = self.finish_effect_drag(None);
+        self.commit_pending_mixer_history();
+        if self.renaming_target.is_some() {
+            return Task::batch([
+                effect_drag_task,
+                iced::widget::operation::is_focused(super::super::TRACK_RENAME_INPUT_ID)
+                    .map(Message::TrackRenameFocusChanged),
+            ]);
+        }
+        effect_drag_task
     }
 
     pub(in crate::app) fn undo_mixer_operation(&mut self) -> Task<Message> {
@@ -415,6 +422,14 @@ impl Lilypalooza {
                 return Task::none();
             }
             MixerMessage::SetProcessorSlotHovered(target) => {
+                if let Some((target, _segment)) = target {
+                    if target.slot_index > 0 {
+                        self.effect_rack_hovered_effect =
+                            Some((target.strip_index, target.slot_index - 1));
+                    }
+                } else if self.effect_drag_source.is_none() {
+                    self.effect_rack_hovered_effect = None;
+                }
                 self.hovered_processor_slot = target;
                 return Task::none();
             }
@@ -423,52 +438,43 @@ impl Lilypalooza {
                 effect_index,
             } => {
                 self.effect_drag_source = Some((strip_index, effect_index));
+                self.effect_drag_target = Some((strip_index, effect_index));
                 return Task::none();
             }
             MixerMessage::DropTrackEffect {
                 strip_index,
                 effect_index,
             } => {
-                let Some((from_strip_index, from_effect_index)) = self.effect_drag_source.take()
-                else {
-                    return Task::none();
-                };
-                if from_strip_index != strip_index || from_effect_index == effect_index {
-                    return Task::none();
-                }
-                return self.handle_mixer_message(MixerMessage::MoveTrackEffect {
-                    strip_index,
-                    from_effect_index,
-                    to_effect_index: effect_index,
-                });
+                return self.finish_effect_drag(Some((strip_index, effect_index)));
             }
             MixerMessage::TrackEffectDragMoved { strip_index, y } => {
-                let Some((from_strip_index, _)) = self.effect_drag_source else {
-                    return Task::none();
-                };
-                if from_strip_index != strip_index {
-                    return Task::none();
-                }
-                if y <= super::super::mixer::EFFECT_RACK_EDGE_SCROLL_ZONE {
-                    return iced::widget::operation::scroll_by(
-                        super::super::mixer::effect_rack_scroll_id(strip_index),
-                        iced::widget::operation::AbsoluteOffset {
-                            x: 0.0,
-                            y: -super::super::mixer::EFFECT_RACK_EDGE_SCROLL_STEP,
-                        },
-                    );
-                }
-                if y >= super::super::mixer::EFFECT_RACK_HEIGHT
-                    - super::super::mixer::EFFECT_RACK_EDGE_SCROLL_ZONE
+                self.update_effect_rack_drag_position(strip_index, y);
+                return self.tick_effect_rack_autoscroll();
+            }
+            MixerMessage::EffectRackCursorLeft(strip_index) => {
+                if self
+                    .effect_rack_hovered_effect
+                    .is_some_and(|(hovered_strip_index, _)| hovered_strip_index == strip_index)
                 {
-                    return iced::widget::operation::scroll_by(
-                        super::super::mixer::effect_rack_scroll_id(strip_index),
-                        iced::widget::operation::AbsoluteOffset {
-                            x: 0.0,
-                            y: super::super::mixer::EFFECT_RACK_EDGE_SCROLL_STEP,
-                        },
-                    );
+                    self.effect_rack_hovered_effect = None;
                 }
+                if self
+                    .effect_drag_source
+                    .is_some_and(|(source_strip_index, _)| source_strip_index == strip_index)
+                {
+                    self.effect_rack_autoscroll_direction = 0;
+                    self.effect_rack_drag_pointer_y = None;
+                }
+                return Task::none();
+            }
+            MixerMessage::EffectRackViewportScrolled {
+                strip_index,
+                viewport,
+            } => {
+                self.effect_rack_scroll_y
+                    .insert(strip_index, viewport.absolute_offset().y);
+                self.effect_rack_viewport_height
+                    .insert(strip_index, viewport.bounds().height);
                 return Task::none();
             }
             MixerMessage::ToggleTrackInstrumentBrowser(track_index) => {
@@ -754,11 +760,18 @@ impl Lilypalooza {
                             }
                             super::super::mixer::ProcessorChoice::Processor {
                                 ref processor_id,
+                                ref name,
                                 ..
                             } => {
-                                let slot = SlotState::built_in(
+                                let mut slot = SlotState::built_in(
                                     processor_id,
                                     lilypalooza_audio::ProcessorState::default(),
+                                );
+                                assign_effect_instance_label_index(
+                                    &effects,
+                                    effect_index,
+                                    name,
+                                    &mut slot,
                                 );
                                 if effect_index < effects.len() {
                                     effects[effect_index] = slot;
@@ -822,6 +835,13 @@ impl Lilypalooza {
                         };
                         if let Err(error) = result {
                             mixer_error = Some(error.to_string());
+                        } else {
+                            self.processor_editor_windows
+                                .move_slot_targets_within_strip(
+                                    strip_index,
+                                    from_effect_index + 1,
+                                    to_effect_index + 1,
+                                );
                         }
                     }
                 }
@@ -872,6 +892,8 @@ impl Lilypalooza {
                 | MixerMessage::StartTrackEffectDrag { .. }
                 | MixerMessage::DropTrackEffect { .. }
                 | MixerMessage::TrackEffectDragMoved { .. }
+                | MixerMessage::EffectRackCursorLeft(_)
+                | MixerMessage::EffectRackViewportScrolled { .. }
                 | MixerMessage::ToggleTrackInstrumentBrowser(_)
                 | MixerMessage::CloseTrackInstrumentBrowser
                 | MixerMessage::InstrumentBrowserSearchChanged(_)
@@ -904,6 +926,124 @@ impl Lilypalooza {
             self.mixer_undo_stack.push(snapshot);
             self.mixer_redo_stack.clear();
         }
+    }
+
+    fn begin_effect_drag_from_hover(&mut self) {
+        let Some(source) = self.effect_rack_hovered_effect else {
+            return;
+        };
+        self.effect_drag_source = Some(source);
+        self.effect_drag_target = Some(source);
+    }
+
+    fn finish_effect_drag(&mut self, target: Option<(usize, usize)>) -> Task<Message> {
+        let source = self.effect_drag_source.take();
+        let target = target.or(self.effect_drag_target);
+        self.effect_drag_target = None;
+        self.effect_rack_autoscroll_direction = 0;
+        self.effect_rack_drag_pointer_y = None;
+
+        let Some((from_strip_index, from_effect_index)) = source else {
+            return Task::none();
+        };
+        let Some((to_strip_index, to_effect_index)) = target else {
+            return Task::none();
+        };
+        if from_strip_index != to_strip_index || from_effect_index == to_effect_index {
+            return Task::none();
+        }
+
+        self.handle_mixer_message(MixerMessage::MoveTrackEffect {
+            strip_index: from_strip_index,
+            from_effect_index,
+            to_effect_index,
+        })
+    }
+
+    fn update_effect_rack_drag_position(&mut self, strip_index: usize, y: f32) {
+        let hover = self.effect_rack_hovered_index_at_y(strip_index, y);
+        self.effect_rack_hovered_effect = hover.map(|index| (strip_index, index));
+
+        if self
+            .effect_drag_source
+            .is_some_and(|(source_strip, _)| source_strip == strip_index)
+            && let Some(target_index) = self.effect_rack_drop_index_at_y(strip_index, y)
+        {
+            self.effect_drag_target = Some((strip_index, target_index));
+            self.effect_rack_drag_pointer_y = Some(y);
+            self.update_effect_rack_autoscroll_direction(strip_index, y);
+        }
+    }
+
+    fn effect_rack_hovered_index_at_y(&self, strip_index: usize, y: f32) -> Option<usize> {
+        let index = self.effect_rack_raw_index_at_y(strip_index, y);
+        (index < self.effect_count_for_strip(strip_index)?).then_some(index)
+    }
+
+    fn effect_rack_drop_index_at_y(&self, strip_index: usize, y: f32) -> Option<usize> {
+        let effect_count = self.effect_count_for_strip(strip_index)?;
+        if effect_count == 0 {
+            return None;
+        }
+        Some(
+            self.effect_rack_raw_index_at_y(strip_index, y)
+                .min(effect_count - 1),
+        )
+    }
+
+    fn effect_rack_raw_index_at_y(&self, strip_index: usize, y: f32) -> usize {
+        let scroll_y = self
+            .effect_rack_scroll_y
+            .get(&strip_index)
+            .copied()
+            .unwrap_or(0.0);
+        ((scroll_y + y).max(0.0) / super::super::mixer::EFFECT_RACK_ROW_HEIGHT).floor() as usize
+    }
+
+    fn effect_count_for_strip(&self, strip_index: usize) -> Option<usize> {
+        let mixer = self.playback.as_ref()?.mixer_state();
+        mixer
+            .strip_by_index(strip_index)
+            .map(lilypalooza_audio::mixer::Track::effect_count)
+    }
+
+    fn update_effect_rack_autoscroll_direction(&mut self, strip_index: usize, y: f32) {
+        let viewport_height = self
+            .effect_rack_viewport_height
+            .get(&strip_index)
+            .copied()
+            .unwrap_or(super::super::mixer::EFFECT_RACK_HEIGHT);
+        let edge = super::super::mixer::EFFECT_RACK_EDGE_SCROLL_ZONE.min(viewport_height / 2.0);
+        self.effect_rack_autoscroll_direction = if y <= edge {
+            -1
+        } else if y >= viewport_height - edge {
+            1
+        } else {
+            0
+        };
+    }
+
+    pub(in crate::app) fn tick_effect_rack_autoscroll(&mut self) -> Task<Message> {
+        let Some((strip_index, _)) = self.effect_drag_source else {
+            return Task::none();
+        };
+        if self.effect_rack_autoscroll_direction == 0 {
+            return Task::none();
+        }
+        if let Some(y) = self.effect_rack_drag_pointer_y {
+            self.effect_drag_target = self
+                .effect_rack_drop_index_at_y(strip_index, y)
+                .map(|index| (strip_index, index));
+        }
+
+        iced::widget::operation::scroll_by(
+            super::super::mixer::effect_rack_scroll_id(strip_index),
+            iced::widget::operation::AbsoluteOffset {
+                x: 0.0,
+                y: super::super::mixer::EFFECT_RACK_EDGE_SCROLL_STEP
+                    * f32::from(self.effect_rack_autoscroll_direction),
+            },
+        )
     }
 }
 
@@ -977,6 +1117,8 @@ fn mixer_message_history_mode(
         | MixerMessage::StartTrackEffectDrag { .. }
         | MixerMessage::DropTrackEffect { .. }
         | MixerMessage::TrackEffectDragMoved { .. }
+        | MixerMessage::EffectRackCursorLeft(_)
+        | MixerMessage::EffectRackViewportScrolled { .. }
         | MixerMessage::ToggleTrackInstrumentBrowser(_)
         | MixerMessage::CloseTrackInstrumentBrowser
         | MixerMessage::InstrumentBrowserSearchChanged(_)
@@ -1352,6 +1494,36 @@ fn default_track_instrument_slot(
     }
 
     SlotState::built_in(processor_id, lilypalooza_audio::ProcessorState::default())
+}
+
+fn assign_effect_instance_label_index(
+    effects: &[SlotState],
+    target_effect_index: usize,
+    processor_name: &str,
+    slot: &mut SlotState,
+) {
+    if let Some(existing) = effects.get(target_effect_index)
+        && effect_slot_name(existing) == Some(processor_name)
+        && existing.instance_label_index > 0
+    {
+        slot.instance_label_index = existing.instance_label_index;
+        return;
+    }
+
+    let mut used = std::collections::BTreeSet::new();
+    for (effect_index, effect) in effects.iter().enumerate() {
+        if effect_index != target_effect_index && effect_slot_name(effect) == Some(processor_name) {
+            used.insert(effect.instance_label_index);
+        }
+    }
+
+    slot.instance_label_index = (1..)
+        .find(|index| !used.contains(index))
+        .expect("infinite label index range should have a free value");
+}
+
+fn effect_slot_name(slot: &SlotState) -> Option<&'static str> {
+    lilypalooza_audio::instrument::registry::resolve(&slot.kind).map(|entry| entry.name)
 }
 
 fn sync_piano_roll_mix_from_mixer_state(
@@ -1837,6 +2009,58 @@ mod tests {
     }
 
     #[test]
+    fn selecting_track_effect_uses_lowest_free_duplicate_label_index() {
+        lilypalooza_builtins::register_all();
+        let mut app = test_app();
+        let mut playback =
+            AudioEngine::start_cpal(MixerState::new(), AudioEngineOptions::default())
+                .expect("test audio engine should start");
+        let mut first = SlotState::built_in(
+            lilypalooza_audio::BUILTIN_GAIN_ID,
+            lilypalooza_audio::ProcessorState::default(),
+        );
+        first.instance_label_index = 1;
+        let mut third = SlotState::built_in(
+            lilypalooza_audio::BUILTIN_GAIN_ID,
+            lilypalooza_audio::ProcessorState::default(),
+        );
+        third.instance_label_index = 3;
+        playback
+            .mixer()
+            .set_track_effects(TrackId(0), vec![first, third])
+            .expect("effects should be installed");
+        app.playback = Some(playback);
+
+        let _ = app.handle_mixer_message(MixerMessage::SelectProcessor(
+            EditorTarget {
+                strip_index: 1,
+                slot_index: 3,
+            },
+            crate::app::mixer::ProcessorChoice::Processor {
+                processor_id: lilypalooza_audio::BUILTIN_GAIN_ID.to_string(),
+                name: "Gain".to_string(),
+                backend: crate::app::mixer::ProcessorBrowserBackend::BuiltIn,
+            },
+        ));
+
+        let track = app
+            .playback
+            .as_ref()
+            .expect("playback should exist")
+            .mixer_state()
+            .track(TrackId(0))
+            .expect("track should exist");
+
+        assert_eq!(
+            track
+                .effect(2)
+                .expect("new effect should exist")
+                .instance_label_index,
+            2
+        );
+    }
+
+    #[test]
     fn selecting_master_effect_adds_effect_slot() {
         lilypalooza_builtins::register_all();
         let mut app = test_app();
@@ -2025,6 +2249,204 @@ mod tests {
             .expect("track should exist");
         assert_eq!(track.effect(0), Some(&second));
         assert_eq!(track.effect(1), Some(&first));
+        assert_eq!(app.effect_drag_source, None);
+    }
+
+    #[test]
+    fn rack_hover_press_drag_release_reorders_effect_slots() {
+        lilypalooza_builtins::register_all();
+        let mut app = test_app();
+        let mut playback =
+            AudioEngine::start_cpal(MixerState::new(), AudioEngineOptions::default())
+                .expect("test audio engine should start");
+        let first = SlotState::built_in(
+            lilypalooza_audio::BUILTIN_GAIN_ID,
+            lilypalooza_audio::ProcessorState(vec![1]),
+        );
+        let second = SlotState::built_in(
+            lilypalooza_audio::BUILTIN_GAIN_ID,
+            lilypalooza_audio::ProcessorState(vec![2]),
+        );
+        let third = SlotState::built_in(
+            lilypalooza_audio::BUILTIN_GAIN_ID,
+            lilypalooza_audio::ProcessorState(vec![3]),
+        );
+        playback
+            .mixer()
+            .set_track_effects(
+                TrackId(0),
+                vec![first.clone(), second.clone(), third.clone()],
+            )
+            .expect("effects should be installed");
+        app.playback = Some(playback);
+        let row_height = crate::app::mixer::EFFECT_RACK_HEIGHT / 7.0;
+
+        let _ = app.handle_mixer_message(MixerMessage::TrackEffectDragMoved {
+            strip_index: 1,
+            y: row_height * 0.5,
+        });
+        let _ = app.handle_primary_mouse_pressed(true);
+        let _ = app.handle_mixer_message(MixerMessage::TrackEffectDragMoved {
+            strip_index: 1,
+            y: row_height * 2.5,
+        });
+        let _ = app.handle_primary_mouse_pressed(false);
+
+        let track = app
+            .playback
+            .as_ref()
+            .expect("playback should exist")
+            .mixer_state()
+            .track(TrackId(0))
+            .expect("track should exist");
+        assert_eq!(track.effect(0), Some(&second));
+        assert_eq!(track.effect(1), Some(&third));
+        assert_eq!(track.effect(2), Some(&first));
+    }
+
+    #[test]
+    fn processor_slot_hover_can_start_effect_drag() {
+        lilypalooza_builtins::register_all();
+        let mut app = test_app();
+        let mut playback =
+            AudioEngine::start_cpal(MixerState::new(), AudioEngineOptions::default())
+                .expect("test audio engine should start");
+        playback
+            .mixer()
+            .set_track_effects(
+                TrackId(0),
+                vec![SlotState::built_in(
+                    lilypalooza_audio::BUILTIN_GAIN_ID,
+                    lilypalooza_audio::ProcessorState(vec![1]),
+                )],
+            )
+            .expect("effects should be installed");
+        app.playback = Some(playback);
+
+        let target = EditorTarget {
+            strip_index: 1,
+            slot_index: 1,
+        };
+        let _ = app.handle_mixer_message(MixerMessage::SetProcessorSlotHovered(Some((
+            target,
+            crate::app::mixer::ProcessorSlotSegment::Editor,
+        ))));
+        let _ = app.handle_primary_mouse_pressed(true);
+
+        assert_eq!(app.effect_drag_source, Some((1, 0)));
+        assert_eq!(app.effect_drag_target, Some((1, 0)));
+    }
+
+    #[test]
+    fn rack_drag_target_uses_scroll_offset() {
+        lilypalooza_builtins::register_all();
+        let mut app = test_app();
+        let mut playback =
+            AudioEngine::start_cpal(MixerState::new(), AudioEngineOptions::default())
+                .expect("test audio engine should start");
+        let effects: Vec<_> = (1..=4)
+            .map(|value| {
+                SlotState::built_in(
+                    lilypalooza_audio::BUILTIN_GAIN_ID,
+                    lilypalooza_audio::ProcessorState(vec![value]),
+                )
+            })
+            .collect();
+        playback
+            .mixer()
+            .set_track_effects(TrackId(0), effects.clone())
+            .expect("effects should be installed");
+        app.playback = Some(playback);
+        let row_height = crate::app::mixer::EFFECT_RACK_ROW_HEIGHT;
+        app.effect_rack_scroll_y.insert(1, row_height * 2.0);
+
+        let _ = app.handle_mixer_message(MixerMessage::StartTrackEffectDrag {
+            strip_index: 1,
+            effect_index: 0,
+        });
+        let _ = app.handle_mixer_message(MixerMessage::TrackEffectDragMoved {
+            strip_index: 1,
+            y: row_height * 1.5,
+        });
+        let _ = app.handle_primary_mouse_pressed(false);
+
+        let track = app
+            .playback
+            .as_ref()
+            .expect("playback should exist")
+            .mixer_state()
+            .track(TrackId(0))
+            .expect("track should exist");
+        assert_eq!(track.effect(0), Some(&effects[1]));
+        assert_eq!(track.effect(1), Some(&effects[2]));
+        assert_eq!(track.effect(2), Some(&effects[3]));
+        assert_eq!(track.effect(3), Some(&effects[0]));
+    }
+
+    #[test]
+    fn rack_drag_near_bottom_enables_push_to_scroll_until_release() {
+        lilypalooza_builtins::register_all();
+        let mut app = test_app();
+        let mut playback =
+            AudioEngine::start_cpal(MixerState::new(), AudioEngineOptions::default())
+                .expect("test audio engine should start");
+        playback
+            .mixer()
+            .set_track_effects(
+                TrackId(0),
+                vec![SlotState::built_in(
+                    lilypalooza_audio::BUILTIN_GAIN_ID,
+                    lilypalooza_audio::ProcessorState(vec![1]),
+                )],
+            )
+            .expect("effects should be installed");
+        app.playback = Some(playback);
+        app.effect_rack_viewport_height
+            .insert(1, crate::app::mixer::EFFECT_RACK_HEIGHT);
+
+        let _ = app.handle_mixer_message(MixerMessage::StartTrackEffectDrag {
+            strip_index: 1,
+            effect_index: 0,
+        });
+        let _ = app.handle_mixer_message(MixerMessage::TrackEffectDragMoved {
+            strip_index: 1,
+            y: crate::app::mixer::EFFECT_RACK_HEIGHT - 1.0,
+        });
+
+        assert_eq!(app.effect_rack_autoscroll_direction, 1);
+
+        let _ = app.handle_primary_mouse_pressed(false);
+
+        assert_eq!(app.effect_rack_autoscroll_direction, 0);
+    }
+
+    #[test]
+    fn rack_cursor_exit_clears_hovered_effect_before_mouse_press() {
+        lilypalooza_builtins::register_all();
+        let mut app = test_app();
+        let mut playback =
+            AudioEngine::start_cpal(MixerState::new(), AudioEngineOptions::default())
+                .expect("test audio engine should start");
+        playback
+            .mixer()
+            .set_track_effects(
+                TrackId(0),
+                vec![SlotState::built_in(
+                    lilypalooza_audio::BUILTIN_GAIN_ID,
+                    lilypalooza_audio::ProcessorState(vec![1]),
+                )],
+            )
+            .expect("effects should be installed");
+        app.playback = Some(playback);
+
+        let _ = app.handle_mixer_message(MixerMessage::TrackEffectDragMoved {
+            strip_index: 1,
+            y: crate::app::mixer::EFFECT_RACK_ROW_HEIGHT * 0.5,
+        });
+        let _ = app.handle_mixer_message(MixerMessage::EffectRackCursorLeft(1));
+        let _ = app.handle_primary_mouse_pressed(true);
+
+        assert_eq!(app.effect_rack_hovered_effect, None);
         assert_eq!(app.effect_drag_source, None);
     }
 

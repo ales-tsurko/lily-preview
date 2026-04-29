@@ -6,7 +6,7 @@ pub mod registry;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use knyst::r#gen::{Gen, GenContext};
@@ -17,12 +17,33 @@ use knyst::prelude::{
     BlockSize, GenState, KnystCommands, MultiThreadedKnystCommands, Resources, Sample, impl_gen,
 };
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::soundfont::{LoadedSoundfont, SoundfontResource, SoundfontSynthSettings};
 
 /// Built-in empty instrument id.
 pub const BUILTIN_NONE_ID: &str = "org.lilypalooza.none";
+static NEXT_SLOT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_slot_instance_id() -> u64 {
+    NEXT_SLOT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn reserve_slot_instance_id(instance_id: u64) {
+    let next = instance_id.saturating_add(1);
+    let mut current = NEXT_SLOT_INSTANCE_ID.load(Ordering::Relaxed);
+    while current < next {
+        match NEXT_SLOT_INSTANCE_ID.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
 /// Built-in SoundFont instrument id.
 pub const BUILTIN_SOUNDFONT_ID: &str = "org.lilypalooza.soundfont";
 /// Built-in gain effect id.
@@ -302,8 +323,12 @@ pub enum ProcessorKind {
 }
 
 /// Persisted processor slot state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SlotState {
+    /// Stable persisted identity for this slot instance.
+    pub instance_id: u64,
+    /// Stable user-facing instance number used when identical processors share a rack.
+    pub instance_label_index: u32,
     /// Which backend this slot uses.
     pub kind: ProcessorKind,
     /// Opaque persisted processor state.
@@ -312,9 +337,37 @@ pub struct SlotState {
     pub bypassed: bool,
 }
 
+impl<'de> Deserialize<'de> for SlotState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct PersistedSlotState {
+            instance_id: u64,
+            instance_label_index: u32,
+            kind: ProcessorKind,
+            state: ProcessorState,
+            bypassed: bool,
+        }
+
+        let slot = PersistedSlotState::deserialize(deserializer)?;
+        reserve_slot_instance_id(slot.instance_id);
+        Ok(Self {
+            instance_id: slot.instance_id,
+            instance_label_index: slot.instance_label_index,
+            kind: slot.kind,
+            state: slot.state,
+            bypassed: slot.bypassed,
+        })
+    }
+}
+
 impl Default for SlotState {
     fn default() -> Self {
         Self {
+            instance_id: next_slot_instance_id(),
+            instance_label_index: 1,
             kind: ProcessorKind::BuiltIn {
                 processor_id: BUILTIN_NONE_ID.to_string(),
             },
@@ -329,6 +382,8 @@ impl SlotState {
     #[must_use]
     pub fn new(kind: ProcessorKind, state: ProcessorState) -> Self {
         Self {
+            instance_id: next_slot_instance_id(),
+            instance_label_index: 1,
             kind,
             state,
             bypassed: false,
@@ -1181,13 +1236,10 @@ mod tests {
             },
             |_| Ok(None),
         )]);
-        let slot = crate::instrument::SlotState {
-            kind: crate::instrument::ProcessorKind::BuiltIn {
-                processor_id: crate::instrument::BUILTIN_GAIN_ID.to_string(),
-            },
-            state: crate::instrument::ProcessorState::default(),
-            bypassed: false,
-        };
+        let slot = crate::instrument::SlotState::built_in(
+            crate::instrument::BUILTIN_GAIN_ID,
+            crate::instrument::ProcessorState::default(),
+        );
 
         let descriptor = slot
             .descriptor()
@@ -1195,5 +1247,20 @@ mod tests {
 
         assert_eq!(descriptor.name, "Gain");
         assert!(descriptor.editor.is_none());
+    }
+
+    #[test]
+    fn slot_state_roundtrip_preserves_instance_id() {
+        let mut slot = SlotState::built_in(
+            crate::instrument::BUILTIN_GAIN_ID,
+            crate::instrument::ProcessorState::default(),
+        );
+        slot.instance_label_index = 7;
+
+        let ron = ron::to_string(&slot).expect("slot should serialize");
+        let restored: SlotState = ron::from_str(&ron).expect("slot should deserialize");
+
+        assert_eq!(restored.instance_id, slot.instance_id);
+        assert_eq!(restored.instance_label_index, slot.instance_label_index);
     }
 }

@@ -1322,13 +1322,10 @@ mod tests {
         mixer
             .track_mut(TrackId(0))
             .expect("track should exist")
-            .push_effect(SlotState {
-                kind: ProcessorKind::BuiltIn {
-                    processor_id: BUILTIN_GAIN_ID.to_string(),
-                },
-                state: ProcessorState::default(),
-                bypassed: false,
-            });
+            .push_effect(SlotState::built_in(
+                BUILTIN_GAIN_ID,
+                ProcessorState::default(),
+            ));
 
         let ron = ron::to_string(&mixer).expect("mixer should serialize");
         let restored: MixerState = ron::from_str(&ron).expect("mixer should deserialize");
@@ -1341,12 +1338,10 @@ mod tests {
         mixer
             .track_mut(TrackId(0))
             .expect("track should exist")
-            .push_effect(SlotState {
-                kind: ProcessorKind::BuiltIn {
-                    processor_id: BUILTIN_GAIN_ID.to_string(),
-                },
-                state: ProcessorState::default(),
-                bypassed: true,
+            .push_effect({
+                let mut slot = SlotState::built_in(BUILTIN_GAIN_ID, ProcessorState::default());
+                slot.bypassed = true;
+                slot
             });
 
         let ron = ron::to_string(&mixer).expect("mixer should serialize");
@@ -1391,24 +1386,18 @@ mod tests {
         mixer
             .track_mut(TrackId(0))
             .expect("track should exist")
-            .push_effect(SlotState {
-                kind: ProcessorKind::BuiltIn {
-                    processor_id: BUILTIN_GAIN_ID.to_string(),
-                },
-                state: ProcessorState::default(),
-                bypassed: false,
-            });
+            .push_effect(SlotState::built_in(
+                BUILTIN_GAIN_ID,
+                ProcessorState::default(),
+            ));
         let bus_id = mixer.add_bus("Verb");
         mixer
             .bus_mut(bus_id)
             .expect("bus should exist")
-            .push_effect(SlotState {
-                kind: ProcessorKind::BuiltIn {
-                    processor_id: BUILTIN_GAIN_ID.to_string(),
-                },
-                state: ProcessorState::default(),
-                bypassed: false,
-            });
+            .push_effect(SlotState::built_in(
+                BUILTIN_GAIN_ID,
+                ProcessorState::default(),
+            ));
 
         let track = mixer.strip_by_index(1).expect("track strip should exist");
         assert_eq!(track.slot(0), track.instrument_slot());

@@ -150,6 +150,7 @@ impl Lilypalooza {
         }
 
         tasks.push(self.tick_editor_tabbar_autoscroll());
+        tasks.push(self.tick_effect_rack_autoscroll());
 
         if let Some(tab_id) = self.pending_reveal_editor_tab {
             if self.editor.tab_ids().contains(&tab_id) {

@@ -58,7 +58,8 @@ pub(in crate::app) const EFFECT_RACK_EDGE_SCROLL_STEP: f32 = ui_style::grid_f32(
 const EFFECT_RACK_PANEL_WIDTH: f32 = ui_style::grid_f32(36);
 const EFFECT_RACK_SLOT_WIDTH: f32 = EFFECT_RACK_PANEL_WIDTH;
 const EFFECT_RACK_SEPARATOR_HEIGHT: f32 = 1.0;
-const EFFECT_RACK_ROW_HEIGHT: f32 = PROCESSOR_SLOT_BUTTON_HEIGHT + EFFECT_RACK_SEPARATOR_HEIGHT;
+pub(in crate::app) const EFFECT_RACK_ROW_HEIGHT: f32 =
+    PROCESSOR_SLOT_BUTTON_HEIGHT + EFFECT_RACK_SEPARATOR_HEIGHT;
 const EFFECT_RACK_SEPARATOR_INSET: f32 = ui_style::grid_f32(4);
 const EFFECT_RACK_SCROLLBAR_WIDTH: f32 = 6.0;
 const EFFECT_RACK_SCROLLBAR_SCROLLER_WIDTH: f32 = 3.0;
@@ -177,6 +178,52 @@ struct EffectRackPanelRouting {
     source: RoutingStrip,
     sends: Vec<SendDependency>,
     send_choices: Vec<SendDestinationChoice>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EffectRackDragState {
+    source_effect_index: usize,
+    target_effect_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectRackDropIndicator {
+    Top,
+    After(usize),
+}
+
+fn effect_rack_drag_state(
+    source: Option<(usize, usize)>,
+    target: Option<(usize, usize)>,
+    strip_index: usize,
+) -> Option<EffectRackDragState> {
+    let (source_strip, source_effect_index) = source?;
+    let (target_strip, target_effect_index) = target?;
+
+    (source_strip == strip_index
+        && target_strip == strip_index
+        && source_effect_index != target_effect_index)
+        .then_some(EffectRackDragState {
+            source_effect_index,
+            target_effect_index,
+        })
+}
+
+fn effect_rack_drop_indicator(
+    drag_state: Option<EffectRackDragState>,
+) -> Option<EffectRackDropIndicator> {
+    let drag_state = drag_state?;
+    if drag_state.source_effect_index < drag_state.target_effect_index {
+        Some(EffectRackDropIndicator::After(
+            drag_state.target_effect_index,
+        ))
+    } else if drag_state.target_effect_index == 0 {
+        Some(EffectRackDropIndicator::Top)
+    } else {
+        Some(EffectRackDropIndicator::After(
+            drag_state.target_effect_index - 1,
+        ))
+    }
 }
 
 fn noop_message() -> Message {
@@ -321,6 +368,8 @@ struct TrackStripDependency {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct EffectSlotDependency {
     slot_index: usize,
+    instance_id: u64,
+    instance_label_index: u32,
     selected: Option<ProcessorChoice>,
     editor_enabled: bool,
     bypassed: bool,
@@ -510,6 +559,7 @@ pub(super) fn content(app: &Lilypalooza) -> Element<'_, Message> {
                     gain_mode,
                     &app.open_mixer_effect_rack_tracks,
                     app.hovered_processor_slot,
+                    effect_rack_drag_state(app.effect_drag_source, app.effect_drag_target, 0),
                     true,
                 ))
                 .width(Length::Fixed(master_width))
@@ -531,6 +581,8 @@ pub(super) fn content(app: &Lilypalooza) -> Element<'_, Message> {
                     track_rename_color_picker_open,
                     app.selected_track_index,
                     app.hovered_processor_slot,
+                    app.effect_drag_source,
+                    app.effect_drag_target,
                     &app.open_mixer_effect_rack_tracks,
                     true,
                 ))
@@ -546,6 +598,8 @@ pub(super) fn content(app: &Lilypalooza) -> Element<'_, Message> {
                     bus_visible,
                     &app.open_mixer_effect_rack_tracks,
                     app.hovered_processor_slot,
+                    app.effect_drag_source,
+                    app.effect_drag_target,
                     renaming_target,
                     renaming_origin,
                     &track_rename_value,
@@ -629,6 +683,7 @@ fn mixer_layout_without_audio<'a>(
             gain_mode,
             &[],
             None,
+            None,
             false,
         ))
         .width(Length::Fixed(MAIN_SECTION_WIDTH))
@@ -650,6 +705,8 @@ fn mixer_layout_without_audio<'a>(
             false,
             selected_track_index,
             None,
+            None,
+            None,
             &[],
             false,
         ))
@@ -664,6 +721,8 @@ fn mixer_layout_without_audio<'a>(
             gain_mode,
             bus_visible,
             &[],
+            None,
+            None,
             None,
             renaming_target,
             None,
@@ -693,6 +752,7 @@ fn master_track_area(
         super::processor_editor_windows::EditorTarget,
         ProcessorSlotSegment,
     )>,
+    effect_drag: Option<EffectRackDragState>,
     controls_enabled: bool,
 ) -> Element<'static, Message> {
     let mut master_row = row![sticky_master_strip(
@@ -709,10 +769,10 @@ fn master_track_area(
     if open_effect_rack_strips.contains(&0) {
         master_row = master_row.push(track_effect_rack_panel(
             0,
-            &mixer.master().name,
             effect_slot_dependencies(mixer.master()),
             None,
             hovered_processor_slot,
+            effect_drag,
             controls_enabled,
             strip_height,
         ));
@@ -854,6 +914,8 @@ fn instrument_track_area(
         super::processor_editor_windows::EditorTarget,
         ProcessorSlotSegment,
     )>,
+    effect_drag_source: Option<(usize, usize)>,
+    effect_drag_target: Option<(usize, usize)>,
     open_effect_rack_strips: &[usize],
     controls_enabled: bool,
 ) -> Element<'static, Message> {
@@ -1053,7 +1115,6 @@ fn instrument_track_area(
             if effect_rack_open {
                 row.push(track_effect_rack_panel(
                     strip_index,
-                    &track.name,
                     effects.clone(),
                     Some(EffectRackPanelRouting {
                         source: RoutingStrip::Track(track_index),
@@ -1064,6 +1125,7 @@ fn instrument_track_area(
                         ),
                     }),
                     strip_hovered_processor_slot,
+                    effect_rack_drag_state(effect_drag_source, effect_drag_target, strip_index),
                     controls_enabled,
                     strip_height,
                 ))
@@ -1123,6 +1185,8 @@ fn effect_slot_dependencies(strip: &lilypalooza_audio::mixer::Track) -> Vec<Effe
         .enumerate()
         .map(|(effect_index, slot)| EffectSlotDependency {
             slot_index: effect_index + 1,
+            instance_id: slot.instance_id,
+            instance_label_index: slot.instance_label_index,
             selected: selected_processor_choice(Some(slot), ProcessorSlotRole::Effect),
             editor_enabled: slot
                 .descriptor()
@@ -1131,6 +1195,34 @@ fn effect_slot_dependencies(strip: &lilypalooza_audio::mixer::Track) -> Vec<Effe
             bypassed: slot.bypassed,
         })
         .collect()
+}
+
+fn effect_slot_display_labels(effects: &[EffectSlotDependency]) -> Vec<Option<String>> {
+    let mut counts_by_name = std::collections::BTreeMap::<String, usize>::new();
+    for effect in effects {
+        if let Some(name) = effect_slot_name(effect) {
+            *counts_by_name.entry(name.to_string()).or_default() += 1;
+        }
+    }
+
+    effects
+        .iter()
+        .map(|effect| {
+            let name = effect_slot_name(effect)?;
+            if counts_by_name.get(name).copied().unwrap_or_default() <= 1 {
+                return Some(name.to_string());
+            }
+
+            Some(format!("{name} [{}]", effect.instance_label_index))
+        })
+        .collect()
+}
+
+fn effect_slot_name(effect: &EffectSlotDependency) -> Option<&str> {
+    match effect.selected.as_ref()? {
+        ProcessorChoice::None => None,
+        ProcessorChoice::Processor { name, .. } => Some(name),
+    }
 }
 
 fn route_choices(mixer: &MixerState, source: RoutingStrip) -> Vec<RouteChoice> {
@@ -1236,13 +1328,13 @@ fn send_dependencies(routing: &TrackRouting) -> Vec<SendDependency> {
 
 fn track_effect_rack_panel(
     strip_index: usize,
-    _title: &str,
     effects: Vec<EffectSlotDependency>,
     routing: Option<EffectRackPanelRouting>,
     hovered_processor_slot: Option<(
         super::processor_editor_windows::EditorTarget,
         ProcessorSlotSegment,
     )>,
+    effect_drag: Option<EffectRackDragState>,
     controls_enabled: bool,
     strip_height: f32,
 ) -> Element<'static, Message> {
@@ -1253,6 +1345,7 @@ fn track_effect_rack_panel(
         strip_index,
         effects,
         hovered_processor_slot,
+        effect_drag,
         controls_enabled,
         EFFECT_RACK_VISIBLE_SLOTS,
     );
@@ -1317,6 +1410,8 @@ fn bus_track_area(
         super::processor_editor_windows::EditorTarget,
         ProcessorSlotSegment,
     )>,
+    effect_drag_source: Option<(usize, usize)>,
+    effect_drag_target: Option<(usize, usize)>,
     renaming_target: Option<super::RenameTarget>,
     renaming_origin: Option<super::WorkspacePaneKind>,
     track_rename_value: &str,
@@ -1522,7 +1617,6 @@ fn bus_track_area(
             if effect_rack_open {
                 row.push(track_effect_rack_panel(
                     strip_index,
-                    &bus.name,
                     effects.clone(),
                     Some(EffectRackPanelRouting {
                         source: RoutingStrip::Bus(bus_id.0),
@@ -1530,6 +1624,7 @@ fn bus_track_area(
                         send_choices: send_destination_choices(mixer, RoutingStrip::Bus(bus_id.0)),
                     }),
                     hovered_processor_slot,
+                    effect_rack_drag_state(effect_drag_source, effect_drag_target, strip_index),
                     controls_enabled,
                     strip_height,
                 ))
@@ -2470,28 +2565,41 @@ fn effect_rack(
     strip_index: usize,
     effects: Vec<EffectSlotDependency>,
     hovered_processor_slot: Option<(usize, ProcessorSlotSegment)>,
+    effect_drag: Option<EffectRackDragState>,
     controls_enabled: bool,
     min_slots: usize,
 ) -> Element<'static, Message> {
+    let indicator = effect_rack_drop_indicator(effect_drag);
+    let labels = effect_slot_display_labels(&effects);
     let mut content = column![].spacing(0).width(Fill);
-    for effect in &effects {
+    if indicator == Some(EffectRackDropIndicator::Top) {
+        content = content.push(effect_rack_drop_indicator_line());
+    }
+    for (effect, label) in effects.iter().zip(labels) {
+        let effect_index = effect.slot_index - 1;
         let target = super::processor_editor_windows::EditorTarget {
             strip_index,
             slot_index: effect.slot_index,
         };
-        content = content.push(effect_rack_filled_slot(processor_slot_controls_sized(
+        content = content.push(effect_rack_draggable_filled_slot(
             target,
-            ProcessorSlotRole::Effect,
-            effect.selected.as_ref(),
-            effect.editor_enabled,
-            effect.bypassed,
-            hovered_processor_slot
-                .filter(|(slot_index, _)| *slot_index == effect.slot_index)
-                .map(|(_, segment)| segment),
+            processor_slot_controls_sized(
+                target,
+                ProcessorSlotRole::Effect,
+                effect.selected.as_ref(),
+                effect.editor_enabled,
+                effect.bypassed,
+                hovered_processor_slot
+                    .filter(|(slot_index, _)| *slot_index == effect.slot_index)
+                    .map(|(_, segment)| segment),
+                controls_enabled,
+                EFFECT_RACK_SLOT_WIDTH,
+                true,
+                label,
+            ),
+            indicator == Some(EffectRackDropIndicator::After(effect_index)),
             controls_enabled,
-            EFFECT_RACK_SLOT_WIDTH,
-            true,
-        )));
+        ));
     }
 
     let slot_count = min_slots.max(effects.len() + 1);
@@ -2512,6 +2620,12 @@ fn effect_rack(
         scrollable(content)
             .id(effect_rack_scroll_id(strip_index))
             .width(Fill)
+            .on_scroll(move |viewport| {
+                Message::Mixer(MixerMessage::EffectRackViewportScrolled {
+                    strip_index,
+                    viewport,
+                })
+            })
             .direction(scrollable::Direction::Vertical(
                 scrollable::Scrollbar::new()
                     .width(EFFECT_RACK_SCROLLBAR_WIDTH)
@@ -2526,12 +2640,18 @@ fn effect_rack(
     .style(effect_rack_surface)
     .into();
 
-    container(mouse_area(rack).on_move(move |position| {
-        Message::Mixer(MixerMessage::TrackEffectDragMoved {
-            strip_index,
-            y: position.y,
-        })
-    }))
+    container(
+        mouse_area(rack)
+            .on_move(move |position| {
+                Message::Mixer(MixerMessage::TrackEffectDragMoved {
+                    strip_index,
+                    y: position.y,
+                })
+            })
+            .on_exit(Message::Mixer(MixerMessage::EffectRackCursorLeft(
+                strip_index,
+            ))),
+    )
     .width(Fill)
     .height(Fill)
     .into()
@@ -2794,6 +2914,7 @@ fn processor_slot_controls(
         controls_enabled,
         PROCESSOR_SLOT_WIDTH,
         false,
+        None,
     )
 }
 
@@ -2848,9 +2969,58 @@ fn effect_rack_empty_slot(
 }
 
 fn effect_rack_filled_slot(content: Element<'static, Message>) -> Element<'static, Message> {
-    column![content, effect_rack_separator()]
+    effect_rack_filled_slot_with_separator(content, effect_rack_separator())
+}
+
+fn effect_rack_filled_slot_with_separator(
+    content: Element<'static, Message>,
+    separator: Element<'static, Message>,
+) -> Element<'static, Message> {
+    column![content, separator]
         .spacing(0)
         .width(Length::Fixed(EFFECT_RACK_SLOT_WIDTH))
+        .into()
+}
+
+fn effect_rack_draggable_filled_slot(
+    target: super::processor_editor_windows::EditorTarget,
+    content: Element<'static, Message>,
+    drop_indicator_after: bool,
+    controls_enabled: bool,
+) -> Element<'static, Message> {
+    let effect_index = target.slot_index - 1;
+    let separator = if drop_indicator_after {
+        effect_rack_drop_indicator_line()
+    } else {
+        effect_rack_separator()
+    };
+    let mut row = mouse_area(effect_rack_filled_slot_with_separator(content, separator))
+        .on_move(move |position| {
+            Message::Mixer(MixerMessage::TrackEffectDragMoved {
+                strip_index: target.strip_index,
+                y: EFFECT_RACK_ROW_HEIGHT * effect_index as f32 + position.y,
+            })
+        })
+        .interaction(mouse::Interaction::Pointer);
+    if controls_enabled {
+        row = row
+            .on_enter(Message::Mixer(MixerMessage::TrackEffectDragMoved {
+                strip_index: target.strip_index,
+                y: EFFECT_RACK_ROW_HEIGHT * (effect_index as f32 + 0.5),
+            }))
+            .on_press(Message::Mixer(MixerMessage::StartTrackEffectDrag {
+                strip_index: target.strip_index,
+                effect_index,
+            }))
+            .on_release(Message::Mixer(MixerMessage::DropTrackEffect {
+                strip_index: target.strip_index,
+                effect_index,
+            }));
+    }
+
+    container(row)
+        .width(Length::Fixed(EFFECT_RACK_SLOT_WIDTH))
+        .height(Length::Fixed(EFFECT_RACK_ROW_HEIGHT))
         .into()
 }
 
@@ -2860,6 +3030,19 @@ fn effect_rack_separator() -> Element<'static, Message> {
             .width(Fill)
             .height(Length::Fixed(EFFECT_RACK_SEPARATOR_HEIGHT))
             .style(effect_rack_separator_surface),
+    )
+    .padding([0, EFFECT_RACK_SEPARATOR_INSET as u16])
+    .width(Fill)
+    .height(Length::Fixed(EFFECT_RACK_SEPARATOR_HEIGHT))
+    .into()
+}
+
+fn effect_rack_drop_indicator_line() -> Element<'static, Message> {
+    container(
+        container(text(""))
+            .width(Fill)
+            .height(Length::Fixed(EFFECT_RACK_SEPARATOR_HEIGHT))
+            .style(effect_rack_drop_indicator_surface),
     )
     .padding([0, EFFECT_RACK_SEPARATOR_INSET as u16])
     .width(Fill)
@@ -3013,6 +3196,14 @@ fn effect_rack_separator_surface(theme: &iced::Theme) -> container::Style {
     }
 }
 
+fn effect_rack_drop_indicator_surface(theme: &iced::Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(palette.primary.strong.color.into()),
+        ..container::Style::default()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn processor_slot_controls_sized(
     target: super::processor_editor_windows::EditorTarget,
@@ -3024,6 +3215,7 @@ fn processor_slot_controls_sized(
     controls_enabled: bool,
     slot_width: f32,
     list_item: bool,
+    label_override: Option<String>,
 ) -> Element<'static, Message> {
     let picker_action =
         controls_enabled.then_some(Message::Mixer(MixerMessage::ToggleProcessorBrowser(target)));
@@ -3038,6 +3230,8 @@ fn processor_slot_controls_sized(
         && !is_empty_choice(selected);
     let label = if list_item && is_empty_choice(selected) {
         "Add effect".to_string()
+    } else if let Some(label) = label_override {
+        processor_hover_label(&label, list_item)
     } else {
         processor_hover_label(&processor_trigger_label(selected), list_item)
     };
@@ -3787,6 +3981,26 @@ mod tests {
         (first.r - second.r).abs() + (first.g - second.g).abs() + (first.b - second.b).abs()
     }
 
+    fn test_effect_slot(
+        slot_index: usize,
+        instance_id: u64,
+        instance_label_index: u32,
+        name: &str,
+    ) -> super::EffectSlotDependency {
+        super::EffectSlotDependency {
+            slot_index,
+            instance_id,
+            instance_label_index,
+            selected: Some(super::ProcessorChoice::Processor {
+                processor_id: name.to_lowercase(),
+                name: name.to_string(),
+                backend: super::ProcessorBrowserBackend::BuiltIn,
+            }),
+            editor_enabled: false,
+            bypassed: false,
+        }
+    }
+
     fn assert_snapshots_differ(
         first: &mut iced_test::Simulator<'_, crate::app::Message>,
         second: &mut iced_test::Simulator<'_, crate::app::Message>,
@@ -4024,6 +4238,8 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
+                None,
                 &[],
                 true,
             ),
@@ -4085,6 +4301,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
                 "",
                 true,
             ),
@@ -4127,6 +4345,8 @@ mod tests {
                 GainControlMode::Knob,
                 0..mixer.bus_count(),
                 &[],
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -4418,7 +4638,7 @@ mod tests {
                 super::EFFECT_RACK_SLOT_WIDTH,
                 super::PROCESSOR_SLOT_BUTTON_HEIGHT,
             ],
-            super::effect_rack(0, Vec::new(), None, true, 1),
+            super::effect_rack(0, Vec::new(), None, None, true, 1),
         );
 
         ui.point_at(iced::Point::new(
@@ -4469,7 +4689,7 @@ mod tests {
                 super::EFFECT_RACK_SLOT_WIDTH,
                 super::PROCESSOR_SLOT_BUTTON_HEIGHT * 3.0,
             ],
-            super::effect_rack(1, Vec::new(), None, true, 3),
+            super::effect_rack(1, Vec::new(), None, None, true, 3),
         );
 
         ui.point_at(iced::Point::new(
@@ -4669,6 +4889,190 @@ mod tests {
 
         assert_eq!(idle.background, None);
         assert_eq!(hovered.background, None);
+    }
+
+    #[test]
+    fn effect_drag_state_only_applies_to_matching_strip() {
+        assert_eq!(
+            super::effect_rack_drag_state(Some((1, 0)), Some((1, 2)), 1),
+            Some(super::EffectRackDragState {
+                source_effect_index: 0,
+                target_effect_index: 2,
+            })
+        );
+        assert_eq!(
+            super::effect_rack_drag_state(Some((1, 0)), Some((2, 2)), 1),
+            None
+        );
+        assert_eq!(
+            super::effect_rack_drag_state(Some((1, 0)), Some((1, 0)), 1),
+            None
+        );
+    }
+
+    #[test]
+    fn effect_rack_drop_indicator_tracks_insert_position() {
+        assert_eq!(
+            super::effect_rack_drop_indicator(Some(super::EffectRackDragState {
+                source_effect_index: 0,
+                target_effect_index: 2,
+            })),
+            Some(super::EffectRackDropIndicator::After(2))
+        );
+        assert_eq!(
+            super::effect_rack_drop_indicator(Some(super::EffectRackDragState {
+                source_effect_index: 2,
+                target_effect_index: 1,
+            })),
+            Some(super::EffectRackDropIndicator::After(0))
+        );
+        assert_eq!(
+            super::effect_rack_drop_indicator(Some(super::EffectRackDragState {
+                source_effect_index: 2,
+                target_effect_index: 0,
+            })),
+            Some(super::EffectRackDropIndicator::Top)
+        );
+    }
+
+    #[test]
+    fn effect_rack_drop_indicator_is_visually_distinct_from_separator() {
+        let separator = super::effect_rack_separator_surface(&Theme::Dark);
+        let indicator = super::effect_rack_drop_indicator_surface(&Theme::Dark);
+
+        assert_ne!(separator.background, indicator.background);
+    }
+
+    #[test]
+    fn effect_rack_drag_indicator_changes_rendered_rack() -> Result<(), iced_test::Error> {
+        let effects = vec![
+            super::EffectSlotDependency {
+                slot_index: 1,
+                instance_id: 10,
+                instance_label_index: 1,
+                selected: None,
+                editor_enabled: false,
+                bypassed: false,
+            },
+            super::EffectSlotDependency {
+                slot_index: 2,
+                instance_id: 11,
+                instance_label_index: 2,
+                selected: None,
+                editor_enabled: false,
+                bypassed: false,
+            },
+            super::EffectSlotDependency {
+                slot_index: 3,
+                instance_id: 12,
+                instance_label_index: 3,
+                selected: None,
+                editor_enabled: false,
+                bypassed: false,
+            },
+        ];
+        let size = [
+            super::EFFECT_RACK_SLOT_WIDTH,
+            super::EFFECT_RACK_ROW_HEIGHT * 4.0,
+        ];
+        let mut idle = Simulator::with_size(
+            iced::Settings::default(),
+            size,
+            super::effect_rack(1, effects.clone(), None, None, true, 4),
+        );
+        let mut dragging = Simulator::with_size(
+            iced::Settings::default(),
+            size,
+            super::effect_rack(
+                1,
+                effects,
+                None,
+                Some(super::EffectRackDragState {
+                    source_effect_index: 0,
+                    target_effect_index: 2,
+                }),
+                true,
+                4,
+            ),
+        );
+
+        assert_snapshots_differ(
+            &mut idle,
+            &mut dragging,
+            "effect_rack_drag_indicator_changes_rendered_rack",
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn effect_slot_display_labels_enumerate_duplicate_names_only() {
+        let effects = vec![
+            test_effect_slot(1, 10, 1, "Gain"),
+            test_effect_slot(2, 11, 1, "Reverb"),
+            test_effect_slot(3, 12, 2, "Gain"),
+        ];
+
+        assert_eq!(
+            super::effect_slot_display_labels(&effects),
+            vec![
+                Some("Gain [1]".to_string()),
+                Some("Reverb".to_string()),
+                Some("Gain [2]".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn effect_slot_display_labels_follow_persistent_label_index_after_reorder() {
+        let effects = vec![
+            test_effect_slot(1, 12, 3, "Gain"),
+            test_effect_slot(2, 10, 1, "Gain"),
+            test_effect_slot(3, 11, 2, "Gain"),
+        ];
+
+        assert_eq!(
+            super::effect_slot_display_labels(&effects),
+            vec![
+                Some("Gain [3]".to_string()),
+                Some("Gain [1]".to_string()),
+                Some("Gain [2]".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn effect_slot_display_labels_do_not_compact_after_middle_instance_removed() {
+        let effects = vec![
+            test_effect_slot(1, 10, 1, "Gain"),
+            test_effect_slot(2, 12, 3, "Gain"),
+        ];
+
+        assert_eq!(
+            super::effect_slot_display_labels(&effects),
+            vec![Some("Gain [1]".to_string()), Some("Gain [3]".to_string())]
+        );
+    }
+
+    #[test]
+    fn effect_rack_renders_duplicate_instance_numbers() {
+        let effects = vec![
+            test_effect_slot(1, 10, 1, "Gain"),
+            test_effect_slot(2, 11, 2, "Gain"),
+            test_effect_slot(3, 12, 3, "Gain"),
+        ];
+        let mut ui = Simulator::with_size(
+            iced::Settings::default(),
+            [
+                super::EFFECT_RACK_SLOT_WIDTH,
+                super::EFFECT_RACK_ROW_HEIGHT * 4.0,
+            ],
+            super::effect_rack(1, effects, None, None, true, 4),
+        );
+
+        assert!(ui.find("Gain [1]").is_ok());
+        assert!(ui.find("Gain [2]").is_ok());
+        assert!(ui.find("Gain [3]").is_ok());
     }
 
     #[test]
@@ -5176,13 +5580,13 @@ mod tests {
             [super::EFFECT_RACK_PANEL_WIDTH, 360.0],
             super::track_effect_rack_panel(
                 1,
-                &mixer.tracks()[0].name,
                 super::effect_slot_dependencies(&mixer.tracks()[0]),
                 Some(super::EffectRackPanelRouting {
                     source: RoutingStrip::Track(0),
                     sends: super::send_dependencies(&mixer.tracks()[0].routing),
                     send_choices: super::send_destination_choices(&mixer, RoutingStrip::Track(0)),
                 }),
+                None,
                 None,
                 true,
                 360.0,
@@ -5222,6 +5626,8 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
+                None,
                 &[1],
                 true,
             ),
@@ -5250,6 +5656,7 @@ mod tests {
                 STRIP_MIN_HEIGHT,
                 GainControlMode::Knob,
                 &[0],
+                None,
                 None,
                 true,
             ),

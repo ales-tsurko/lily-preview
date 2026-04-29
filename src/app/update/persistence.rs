@@ -128,7 +128,13 @@ impl Lilypalooza {
         self.selected_track_index = None;
         self.open_processor_browser_target = None;
         self.hovered_processor_slot = None;
+        self.effect_rack_hovered_effect = None;
         self.effect_drag_source = None;
+        self.effect_drag_target = None;
+        self.effect_rack_autoscroll_direction = 0;
+        self.effect_rack_drag_pointer_y = None;
+        self.effect_rack_scroll_y.clear();
+        self.effect_rack_viewport_height.clear();
         self.open_mixer_effect_rack_tracks.clear();
         self.open_instrument_browser_track = None;
         self.instrument_browser_search.clear();
@@ -177,7 +183,13 @@ impl Lilypalooza {
         self.selected_track_index = None;
         self.open_processor_browser_target = None;
         self.hovered_processor_slot = None;
+        self.effect_rack_hovered_effect = None;
         self.effect_drag_source = None;
+        self.effect_drag_target = None;
+        self.effect_rack_autoscroll_direction = 0;
+        self.effect_rack_drag_pointer_y = None;
+        self.effect_rack_scroll_y.clear();
+        self.effect_rack_viewport_height.clear();
         self.open_mixer_effect_rack_tracks.clear();
         self.open_instrument_browser_track = None;
         self.instrument_browser_search.clear();

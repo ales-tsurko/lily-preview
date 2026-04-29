@@ -258,13 +258,10 @@ fn controller_resolves_track_gain_effect_slot() {
         mixer
             .set_track_effects(
                 TrackId(0),
-                vec![SlotState {
-                    kind: crate::instrument::ProcessorKind::BuiltIn {
-                        processor_id: crate::instrument::BUILTIN_GAIN_ID.to_string(),
-                    },
-                    state: ProcessorState::default(),
-                    bypassed: false,
-                }],
+                vec![SlotState::built_in(
+                    crate::instrument::BUILTIN_GAIN_ID,
+                    ProcessorState::default(),
+                )],
             )
             .expect("track should accept gain effect");
     }
@@ -296,13 +293,10 @@ fn bypassed_track_gain_effect_still_exposes_controller() {
         mixer
             .set_track_effects(
                 TrackId(0),
-                vec![SlotState {
-                    kind: crate::instrument::ProcessorKind::BuiltIn {
-                        processor_id: crate::instrument::BUILTIN_GAIN_ID.to_string(),
-                    },
-                    state: ProcessorState::default(),
-                    bypassed: false,
-                }],
+                vec![SlotState::built_in(
+                    crate::instrument::BUILTIN_GAIN_ID,
+                    ProcessorState::default(),
+                )],
             )
             .expect("track should accept gain effect");
         mixer

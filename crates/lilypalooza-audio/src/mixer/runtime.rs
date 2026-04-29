@@ -2599,13 +2599,12 @@ mod tests {
             state
                 .track_mut(TrackId(track_id as u16))
                 .expect("track should exist")
-                .set_instrument_slot(SlotState {
-                    kind: ProcessorKind::Plugin {
+                .set_instrument_slot(SlotState::new(
+                    ProcessorKind::Plugin {
                         plugin_id: "none".to_string(),
                     },
-                    state: ProcessorState::default(),
-                    bypassed: false,
-                });
+                    ProcessorState::default(),
+                ));
         }
         state
             .track_mut(TrackId(0))
