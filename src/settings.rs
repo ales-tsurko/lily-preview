@@ -215,6 +215,109 @@ pub(crate) struct PlaybackSettings {
     pub(crate) chase_notes_on_seek: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PluginFormat {
+    Clap,
+    Vst3,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct PluginSearchPath {
+    pub(crate) format: PluginFormat,
+    pub(crate) path: PathBuf,
+    pub(crate) enabled: bool,
+}
+
+impl Default for PluginSearchPath {
+    fn default() -> Self {
+        Self {
+            format: PluginFormat::Clap,
+            path: PathBuf::new(),
+            enabled: true,
+        }
+    }
+}
+
+pub(crate) fn default_plugin_search_paths() -> Vec<PluginSearchPath> {
+    default_plugin_search_path_specs()
+        .into_iter()
+        .map(|(format, path)| PluginSearchPath {
+            format,
+            path: expand_home(path),
+            enabled: true,
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn default_plugin_search_path_specs() -> Vec<(PluginFormat, &'static str)> {
+    vec![
+        (PluginFormat::Clap, "/Library/Audio/Plug-Ins/CLAP"),
+        (PluginFormat::Clap, "~/Library/Audio/Plug-Ins/CLAP"),
+        (PluginFormat::Vst3, "/Library/Audio/Plug-Ins/VST3"),
+        (PluginFormat::Vst3, "~/Library/Audio/Plug-Ins/VST3"),
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn default_plugin_search_path_specs() -> Vec<(PluginFormat, &'static str)> {
+    let common = std::env::var("COMMONPROGRAMFILES")
+        .unwrap_or_else(|_| "C:\\Program Files\\Common Files".to_string());
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "~\\AppData\\Local".to_string());
+    vec![
+        (
+            PluginFormat::Clap,
+            Box::leak(format!("{common}\\CLAP").into_boxed_str()),
+        ),
+        (
+            PluginFormat::Clap,
+            Box::leak(format!("{local}\\Programs\\Common\\CLAP").into_boxed_str()),
+        ),
+        (
+            PluginFormat::Vst3,
+            Box::leak(format!("{common}\\VST3").into_boxed_str()),
+        ),
+        (
+            PluginFormat::Vst3,
+            Box::leak(format!("{local}\\Programs\\Common\\VST3").into_boxed_str()),
+        ),
+    ]
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn default_plugin_search_path_specs() -> Vec<(PluginFormat, &'static str)> {
+    vec![
+        (PluginFormat::Clap, "/usr/lib/clap"),
+        (PluginFormat::Clap, "/usr/local/lib/clap"),
+        (PluginFormat::Clap, "~/.clap"),
+        (PluginFormat::Vst3, "/usr/lib/vst3"),
+        (PluginFormat::Vst3, "/usr/local/lib/vst3"),
+        (PluginFormat::Vst3, "~/.vst3"),
+    ]
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(path)
+}
+
+fn plugin_search_paths_is_default(paths: &[PluginSearchPath]) -> bool {
+    paths == default_plugin_search_paths()
+}
+
+fn plugin_format_key(format: PluginFormat) -> &'static str {
+    match format {
+        PluginFormat::Clap => "clap",
+        PluginFormat::Vst3 => "vst3",
+    }
+}
+
 fn default_editor_recent_files_limit() -> usize {
     7
 }
@@ -506,6 +609,8 @@ pub(crate) struct AppSettings {
     )]
     pub(crate) editor_recent_files_limit: usize,
     pub(crate) playback: PlaybackSettings,
+    #[serde(default = "default_plugin_search_paths")]
+    pub(crate) plugin_search_paths: Vec<PluginSearchPath>,
     #[serde(skip_serializing_if = "ShortcutSettings::is_empty")]
     pub(crate) shortcuts: ShortcutSettings,
 }
@@ -517,6 +622,7 @@ impl Default for AppSettings {
             editor_theme: EditorThemeSettings::default(),
             editor_recent_files_limit: default_editor_recent_files_limit(),
             playback: PlaybackSettings::default(),
+            plugin_search_paths: default_plugin_search_paths(),
             shortcuts: ShortcutSettings::default(),
         }
     }
@@ -681,6 +787,29 @@ fn render_settings_file(settings: &AppSettings) -> Result<String, toml::ser::Err
         &settings.playback.chase_notes_on_seek.to_string(),
         &defaults.playback.chase_notes_on_seek.to_string(),
     );
+
+    out.push_str("\n# Plugin scan roots. The scanner runs in the background and validates candidates in an isolated helper process.\n");
+    if plugin_search_paths_is_default(&settings.plugin_search_paths) {
+        for path in &defaults.plugin_search_paths {
+            out.push_str("# [[plugin_search_paths]]\n");
+            out.push_str("# format = ");
+            out.push_str(&format!("{:?}\n", plugin_format_key(path.format)));
+            out.push_str("# path = ");
+            out.push_str(&format!("{:?}\n", path.path.display().to_string()));
+            out.push_str("# enabled = true\n\n");
+        }
+    } else {
+        for path in &settings.plugin_search_paths {
+            out.push_str("[[plugin_search_paths]]\n");
+            out.push_str("format = ");
+            out.push_str(&format!("{:?}\n", plugin_format_key(path.format)));
+            out.push_str("path = ");
+            out.push_str(&format!("{:?}\n", path.path.display().to_string()));
+            out.push_str("enabled = ");
+            out.push_str(&path.enabled.to_string());
+            out.push_str("\n\n");
+        }
+    }
 
     out.push_str("\n[shortcuts]\n");
     out.push_str("# Shortcut overrides. Use View > Actions to discover action ids.\n");
@@ -992,7 +1121,10 @@ fn shortcut_named_key_string(named: ShortcutNamedKey) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppSettings, PlaybackSettings, render_settings_file};
+    use super::{
+        AppSettings, PlaybackSettings, PluginFormat, PluginSearchPath, default_plugin_search_paths,
+        render_settings_file,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -1040,5 +1172,52 @@ mod tests {
         assert_eq!(parsed.playback.sample_rate, Some(48_000));
         assert_eq!(parsed.playback.block_size, Some(128));
         assert!(parsed.playback.chase_notes_on_seek);
+    }
+
+    #[test]
+    fn default_plugin_search_paths_include_all_platform_formats() {
+        let paths = default_plugin_search_paths();
+
+        assert!(paths.iter().any(|path| path.format == PluginFormat::Clap));
+        assert!(paths.iter().any(|path| path.format == PluginFormat::Vst3));
+        assert!(paths.iter().all(|path| path.enabled));
+        assert!(paths.iter().any(|path| {
+            path.path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("clap")
+        }));
+        assert!(paths.iter().any(|path| {
+            path.path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("vst3")
+        }));
+    }
+
+    #[test]
+    fn settings_roundtrip_parses_plugin_search_paths() {
+        let settings = AppSettings {
+            plugin_search_paths: vec![
+                PluginSearchPath {
+                    format: PluginFormat::Clap,
+                    path: PathBuf::from("/plugins/clap"),
+                    enabled: true,
+                },
+                PluginSearchPath {
+                    format: PluginFormat::Vst3,
+                    path: PathBuf::from("/plugins/vst3"),
+                    enabled: false,
+                },
+            ],
+            ..AppSettings::default()
+        };
+
+        let contents =
+            render_settings_file(&settings).expect("settings with plugin paths should render");
+        let parsed: AppSettings =
+            toml::from_str(&contents).expect("rendered settings should parse back");
+
+        assert_eq!(parsed.plugin_search_paths, settings.plugin_search_paths);
     }
 }

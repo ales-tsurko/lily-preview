@@ -1,0 +1,30 @@
+[package]
+name = "lilypalooza-clap"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap-sys = "0.5.0"
+libloading = "0.8.9"
+lilypalooza-audio = { path = "../lilypalooza-audio" }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0.18"
+
+[dev-dependencies]
+serde_json = "1.0"
+tempfile = "3.25.0"
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+bare_urls = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "deny"

@@ -9,6 +9,7 @@ members = [
     "crates/vendor/iced-code-editor",
     "crates/lilypalooza-audio",
     "crates/lilypalooza-builtins",
+    "crates/lilypalooza-clap",
     "crates/lilypalooza-egui-baseview",
 ]
 
@@ -26,11 +27,13 @@ iced_core = { workspace = true }
 iced-code-editor = { path = "crates/vendor/iced-code-editor" }
 lilypalooza-audio = { path = "crates/lilypalooza-audio" }
 lilypalooza-builtins = { path = "crates/lilypalooza-builtins" }
+lilypalooza-clap = { path = "crates/lilypalooza-clap" }
 notify = "8.2.0"
 resvg = "0.45.1"
 ron = "0.8.1"
 rfd = "0.15"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tempfile = "3.25.0"
 thiserror = "2.0.18"
 toml = "0.8"

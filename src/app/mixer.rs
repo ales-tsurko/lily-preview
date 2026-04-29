@@ -3622,21 +3622,16 @@ pub(super) fn instrument_browser_overlay(app: &Lilypalooza) -> Element<'_, Messa
         .padding([ui_style::PADDING_XS, ui_style::PADDING_SM])
         .width(Fill);
 
-    let body = match app.instrument_browser_backend {
-        InstrumentBrowserBackend::BuiltIn => processor_browser_built_in_list(
-            target,
-            role,
-            &choices,
-            selected.as_ref(),
-            &app.instrument_browser_search,
-        ),
-        InstrumentBrowserBackend::Clap => {
-            instrument_browser_empty_state(role.backend_empty_label(ProcessorBrowserBackend::Clap))
-        }
-        InstrumentBrowserBackend::Vst3 => {
-            instrument_browser_empty_state(role.backend_empty_label(ProcessorBrowserBackend::Vst3))
-        }
-    };
+    let backend = app.instrument_browser_backend;
+    let body = processor_browser_list(
+        target,
+        role,
+        &choices,
+        selected.as_ref(),
+        &app.instrument_browser_search,
+        backend,
+        app.plugin_scan.is_active(),
+    );
 
     let dialog = container(
         column![
@@ -3684,14 +3679,16 @@ fn instrument_browser_tab_button(
         .into()
 }
 
-fn processor_browser_built_in_list(
+fn processor_browser_list(
     target: super::processor_editor_windows::EditorTarget,
     role: ProcessorSlotRole,
     choices: &[ProcessorChoice],
     selected: Option<&ProcessorChoice>,
     search: &str,
+    backend: ProcessorBrowserBackend,
+    scan_active: bool,
 ) -> Element<'static, Message> {
-    let browser = processor_browser_entries(choices, InstrumentBrowserBackend::BuiltIn, search);
+    let browser = processor_browser_entries(choices, backend, search);
     let InstrumentBrowserEntries { show_none, entries } = browser;
     let mut content = column![].spacing(0).width(Fill);
     if show_none {
@@ -3712,7 +3709,14 @@ fn processor_browser_built_in_list(
     }
 
     if !show_none && !has_entries {
-        return instrument_browser_empty_state(role.empty_search_label());
+        let label = if backend == ProcessorBrowserBackend::BuiltIn {
+            role.empty_search_label()
+        } else if scan_active {
+            "Scanning plugins..."
+        } else {
+            role.backend_empty_label(backend)
+        };
+        return instrument_browser_empty_state(label);
     }
 
     scrollable(content)
@@ -3803,13 +3807,6 @@ fn processor_browser_entries(
     active_backend: ProcessorBrowserBackend,
     search: &str,
 ) -> InstrumentBrowserEntries {
-    if active_backend != InstrumentBrowserBackend::BuiltIn {
-        return InstrumentBrowserEntries {
-            show_none: false,
-            entries: Vec::new(),
-        };
-    }
-
     let query = search.trim().to_lowercase();
     let matches = |choice: &ProcessorChoice| {
         query.is_empty() || instrument_choice_search_haystack(choice).contains(&query)
@@ -3820,7 +3817,7 @@ fn processor_browser_entries(
     for choice in choices {
         match choice {
             InstrumentChoice::None => {
-                if matches(choice) {
+                if active_backend == InstrumentBrowserBackend::BuiltIn && matches(choice) {
                     show_none = true;
                 }
             }

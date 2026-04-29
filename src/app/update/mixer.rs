@@ -707,11 +707,13 @@ impl Lilypalooza {
                         super::super::mixer::InstrumentChoice::None => SlotState::default(),
                         super::super::mixer::InstrumentChoice::Processor {
                             ref processor_id,
+                            backend,
                             ..
                         } => default_track_instrument_slot(
                             &mixer,
                             TrackId(index as u16),
                             processor_id.as_str(),
+                            backend,
                         ),
                     };
                     if let Err(error) = mixer.set_track_instrument(TrackId(index as u16), slot) {
@@ -737,8 +739,14 @@ impl Lilypalooza {
                             super::super::mixer::ProcessorChoice::None => SlotState::default(),
                             super::super::mixer::ProcessorChoice::Processor {
                                 ref processor_id,
+                                backend,
                                 ..
-                            } => default_track_instrument_slot(&mixer, track_id, processor_id),
+                            } => default_track_instrument_slot(
+                                &mixer,
+                                track_id,
+                                processor_id,
+                                backend,
+                            ),
                         };
                         if let Err(error) = mixer.set_track_instrument(track_id, slot) {
                             mixer_error = Some(error.to_string());
@@ -761,12 +769,10 @@ impl Lilypalooza {
                             super::super::mixer::ProcessorChoice::Processor {
                                 ref processor_id,
                                 ref name,
+                                backend,
                                 ..
                             } => {
-                                let mut slot = SlotState::built_in(
-                                    processor_id,
-                                    lilypalooza_audio::ProcessorState::default(),
-                                );
+                                let mut slot = processor_slot(processor_id, backend);
                                 assign_effect_instance_label_index(
                                     &effects,
                                     effect_index,
@@ -1458,8 +1464,11 @@ fn default_track_instrument_slot(
     mixer: &lilypalooza_audio::MixerHandle<'_>,
     track_id: TrackId,
     processor_id: &str,
+    backend: super::super::mixer::ProcessorBrowserBackend,
 ) -> SlotState {
-    if processor_id == BUILTIN_SOUNDFONT_ID {
+    if backend == super::super::mixer::ProcessorBrowserBackend::BuiltIn
+        && processor_id == BUILTIN_SOUNDFONT_ID
+    {
         let current_state = mixer
             .track(track_id)
             .ok()
@@ -1493,7 +1502,25 @@ fn default_track_instrument_slot(
         );
     }
 
-    SlotState::built_in(processor_id, lilypalooza_audio::ProcessorState::default())
+    processor_slot(processor_id, backend)
+}
+
+fn processor_slot(
+    processor_id: &str,
+    backend: super::super::mixer::ProcessorBrowserBackend,
+) -> SlotState {
+    match backend {
+        super::super::mixer::ProcessorBrowserBackend::BuiltIn => {
+            SlotState::built_in(processor_id, lilypalooza_audio::ProcessorState::default())
+        }
+        super::super::mixer::ProcessorBrowserBackend::Clap
+        | super::super::mixer::ProcessorBrowserBackend::Vst3 => SlotState::new(
+            ProcessorKind::Plugin {
+                plugin_id: processor_id.to_string(),
+            },
+            lilypalooza_audio::ProcessorState::default(),
+        ),
+    }
 }
 
 fn assign_effect_instance_label_index(
@@ -1503,7 +1530,7 @@ fn assign_effect_instance_label_index(
     slot: &mut SlotState,
 ) {
     if let Some(existing) = effects.get(target_effect_index)
-        && effect_slot_name(existing) == Some(processor_name)
+        && effect_slot_name(existing).as_deref() == Some(processor_name)
         && existing.instance_label_index > 0
     {
         slot.instance_label_index = existing.instance_label_index;
@@ -1512,7 +1539,9 @@ fn assign_effect_instance_label_index(
 
     let mut used = std::collections::BTreeSet::new();
     for (effect_index, effect) in effects.iter().enumerate() {
-        if effect_index != target_effect_index && effect_slot_name(effect) == Some(processor_name) {
+        if effect_index != target_effect_index
+            && effect_slot_name(effect).as_deref() == Some(processor_name)
+        {
             used.insert(effect.instance_label_index);
         }
     }
@@ -1522,8 +1551,9 @@ fn assign_effect_instance_label_index(
         .expect("infinite label index range should have a free value");
 }
 
-fn effect_slot_name(slot: &SlotState) -> Option<&'static str> {
-    lilypalooza_audio::instrument::registry::resolve(&slot.kind).map(|entry| entry.name)
+fn effect_slot_name(slot: &SlotState) -> Option<String> {
+    lilypalooza_audio::instrument::registry::resolve(&slot.kind)
+        .map(|entry| entry.name.into_owned())
 }
 
 fn sync_piano_roll_mix_from_mixer_state(

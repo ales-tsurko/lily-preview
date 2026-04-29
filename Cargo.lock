@@ -847,6 +847,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a76abbdb2907f6fd97fb6bc0b7be96b77d328f2dd9669d1075cc03369ed22154"
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3081,12 +3087,14 @@ dependencies = [
  "iced_test",
  "lilypalooza-audio",
  "lilypalooza-builtins",
+ "lilypalooza-clap",
  "midly",
  "notify",
  "resvg",
  "rfd",
  "ron",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
@@ -3124,6 +3132,19 @@ dependencies = [
  "ron",
  "rustysynth",
  "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lilypalooza-clap"
+version = "0.1.0"
+dependencies = [
+ "clap-sys",
+ "libloading",
+ "lilypalooza-audio",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

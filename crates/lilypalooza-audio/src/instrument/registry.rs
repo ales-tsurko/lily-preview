@@ -1,6 +1,9 @@
 //! Processor registry.
 
+use std::borrow::Cow;
 use std::sync::{OnceLock, RwLock};
+
+use serde::{Deserialize, Serialize};
 
 use crate::instrument::{
     BUILTIN_NONE_ID, EffectRuntimeSpec, InstrumentRuntimeContext, InstrumentRuntimeSpec,
@@ -11,7 +14,8 @@ use crate::instrument::{
 pub type Id = &'static str;
 
 /// Processor role in the mixer graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Role {
     /// Instrument slot processor.
     Instrument,
@@ -20,7 +24,8 @@ pub enum Role {
 }
 
 /// Backend family that provides the processor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Backend {
     /// Built into the application.
     BuiltIn,
@@ -31,12 +36,12 @@ pub enum Backend {
 }
 
 /// One discoverable processor entry.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Entry {
     /// Stable processor id.
-    pub id: Id,
+    pub id: Cow<'static, str>,
     /// User-visible processor name.
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     /// Processor role.
     pub role: Role,
     /// Backend family.
@@ -70,8 +75,8 @@ impl Entry {
         descriptor: &'static ProcessorDescriptor,
     ) -> Self {
         Self {
-            id,
-            name,
+            id: Cow::Borrowed(id),
+            name: Cow::Borrowed(name),
             role: Role::Instrument,
             backend: Backend::BuiltIn,
             descriptor,
@@ -92,8 +97,8 @@ impl Entry {
         create: CreateInstrument,
     ) -> Self {
         Self {
-            id,
-            name,
+            id: Cow::Borrowed(id),
+            name: Cow::Borrowed(name),
             role: Role::Instrument,
             backend: Backend::BuiltIn,
             descriptor,
@@ -113,8 +118,8 @@ impl Entry {
         descriptor: &'static ProcessorDescriptor,
     ) -> Self {
         Self {
-            id,
-            name,
+            id: Cow::Borrowed(id),
+            name: Cow::Borrowed(name),
             role: Role::Instrument,
             backend: Backend::BuiltIn,
             descriptor,
@@ -135,8 +140,8 @@ impl Entry {
         create: CreateEffect,
     ) -> Self {
         Self {
-            id,
-            name,
+            id: Cow::Borrowed(id),
+            name: Cow::Borrowed(name),
             role: Role::Effect,
             backend: Backend::BuiltIn,
             descriptor,
@@ -144,6 +149,52 @@ impl Entry {
                 is_empty: false,
                 create_instrument: None,
                 create_effect: Some(create),
+            },
+        }
+    }
+
+    /// Creates a dynamically discovered plugin effect entry.
+    #[must_use]
+    pub fn plugin_effect(
+        id: String,
+        name: String,
+        backend: Backend,
+        descriptor: &'static ProcessorDescriptor,
+        create: CreateEffect,
+    ) -> Self {
+        Self {
+            id: Cow::Owned(id),
+            name: Cow::Owned(name),
+            role: Role::Effect,
+            backend,
+            descriptor,
+            factory: Factory {
+                is_empty: false,
+                create_instrument: None,
+                create_effect: Some(create),
+            },
+        }
+    }
+
+    /// Creates a dynamically discovered plugin instrument entry.
+    #[must_use]
+    pub fn plugin_instrument(
+        id: String,
+        name: String,
+        backend: Backend,
+        descriptor: &'static ProcessorDescriptor,
+        create: CreateInstrument,
+    ) -> Self {
+        Self {
+            id: Cow::Owned(id),
+            name: Cow::Owned(name),
+            role: Role::Instrument,
+            backend,
+            descriptor,
+            factory: Factory {
+                is_empty: false,
+                create_instrument: Some(create),
+                create_effect: None,
             },
         }
     }
@@ -199,7 +250,10 @@ pub fn all() -> Vec<Entry> {
 /// Returns one catalog entry by stable id.
 #[must_use]
 pub fn entry(id: &str) -> Option<Entry> {
-    registry_read().iter().find(|entry| entry.id == id).copied()
+    registry_read()
+        .iter()
+        .find(|entry| entry.id.as_ref() == id)
+        .cloned()
 }
 
 /// Resolves one persisted processor kind into a catalog entry.
@@ -207,7 +261,7 @@ pub fn entry(id: &str) -> Option<Entry> {
 pub fn resolve(kind: &ProcessorKind) -> Option<Entry> {
     match kind {
         ProcessorKind::BuiltIn { processor_id } => entry(processor_id),
-        ProcessorKind::Plugin { .. } => None,
+        ProcessorKind::Plugin { plugin_id } => entry(plugin_id),
     }
 }
 
@@ -277,7 +331,10 @@ mod tests {
         };
 
         assert!(!is_empty(&kind));
-        assert_eq!(entry(BUILTIN_GAIN_ID).map(|entry| entry.name), Some("Gain"));
+        assert_eq!(
+            entry(BUILTIN_GAIN_ID).map(|entry| entry.name.into_owned()),
+            Some("Gain".to_string())
+        );
     }
 
     #[test]
@@ -286,5 +343,26 @@ mod tests {
 
         assert!(slot.is_empty());
         assert_eq!(slot.state, ProcessorState::default());
+    }
+
+    #[test]
+    fn dynamic_plugin_entry_can_be_registered_and_resolved() {
+        register([Entry::plugin_effect(
+            "clap:/tmp/test.clap#org.test.gain".to_string(),
+            "Test Gain".to_string(),
+            Backend::Clap,
+            &TEST_DESCRIPTOR,
+            |_| Ok(None),
+        )]);
+
+        let kind = ProcessorKind::Plugin {
+            plugin_id: "clap:/tmp/test.clap#org.test.gain".to_string(),
+        };
+        let resolved = super::resolve(&kind).expect("dynamic plugin should resolve");
+
+        assert_eq!(resolved.id.as_ref(), "clap:/tmp/test.clap#org.test.gain");
+        assert_eq!(resolved.name.as_ref(), "Test Gain");
+        assert_eq!(resolved.role, Role::Effect);
+        assert_eq!(resolved.backend, Backend::Clap);
     }
 }

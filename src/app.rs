@@ -984,6 +984,9 @@ struct Lilypalooza {
     playback: Option<AudioEngine>,
     soundfont_status: SoundfontStatus,
     playback_settings: settings::PlaybackSettings,
+    plugin_search_paths: Vec<settings::PluginSearchPath>,
+    plugin_scan: crate::plugin_scan::PluginScanState,
+    plugin_scan_cache: crate::plugin_scan::PluginScanCache,
     saved_project_state: Option<ProjectState>,
     project_mixer_state: MixerState,
     processor_presets: processor_presets::ProcessorPresetLibrary,
@@ -1568,6 +1571,9 @@ fn new_with_loaded_state(
         playback,
         soundfont_status: SoundfontStatus::NotSelected,
         playback_settings: stored_settings.playback.clone(),
+        plugin_search_paths: stored_settings.plugin_search_paths.clone(),
+        plugin_scan: crate::plugin_scan::PluginScanState::default(),
+        plugin_scan_cache: crate::plugin_scan::PluginScanCache::load(),
         saved_project_state: None,
         project_mixer_state,
         processor_presets: stored_state.processor_presets.clone(),
@@ -1710,6 +1716,8 @@ fn new_with_loaded_state(
         app.logger
             .push(format!("Editor host setup failed: {error}"));
     }
+    #[cfg(not(test))]
+    app.start_plugin_scan();
 
     app.restore_editor_session(
         &stored_state.editor_tabs,
@@ -1952,6 +1960,7 @@ impl Lilypalooza {
             || self.compile_outputs_loading
             || self.compile_session.is_some()
             || matches!(self.lilypond_status, LilypondStatus::Checking)
+            || self.plugin_scan.is_active()
     }
 
     pub(super) fn spinner_frame(&self) -> &'static str {

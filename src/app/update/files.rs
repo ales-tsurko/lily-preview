@@ -2,6 +2,31 @@ use super::*;
 use crate::app::editor::EditorTabFileState;
 
 impl Lilypalooza {
+    #[cfg_attr(test, allow(dead_code))]
+    pub(in crate::app) fn start_plugin_scan(&mut self) {
+        let cache = self.plugin_scan_cache.clone();
+        self.plugin_scan
+            .start(self.plugin_search_paths.clone(), cache);
+    }
+
+    pub(in crate::app) fn poll_plugin_scan(&mut self) {
+        for event in self.plugin_scan.drain_events() {
+            match event {
+                crate::plugin_scan::PluginScanEvent::Log(line) => self.logger.push(line),
+                crate::plugin_scan::PluginScanEvent::ClapPlugins(plugins) => {
+                    lilypalooza_clap::register_plugins(plugins);
+                }
+                crate::plugin_scan::PluginScanEvent::Finished { summary, cache } => {
+                    let _ = summary;
+                    self.plugin_scan_cache = cache;
+                    if let Err(error) = self.plugin_scan_cache.save() {
+                        self.logger.push(error);
+                    }
+                }
+            }
+        }
+    }
+
     pub(in crate::app) fn handle_startup_checked(
         &mut self,
         result: Result<lilypond::VersionCheck, String>,
@@ -176,6 +201,7 @@ impl Lilypalooza {
 
         self.poll_editor_file_watcher(&mut tasks);
         self.poll_browser_file_watcher(&mut tasks);
+        self.poll_plugin_scan();
 
         if self.editor_tick_active()
             && let Some(tab_id) = self.editor.active_tab_id()

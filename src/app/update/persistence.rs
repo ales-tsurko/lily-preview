@@ -328,6 +328,7 @@ impl Lilypalooza {
                 editor_theme: self.editor.theme_settings(),
                 editor_recent_files_limit: self.editor_recent_files_limit,
                 playback: self.playback_settings.clone(),
+                plugin_search_paths: self.plugin_search_paths.clone(),
                 shortcuts: self.shortcut_settings.clone(),
             })?;
         }
