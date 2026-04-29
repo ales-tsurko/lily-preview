@@ -151,6 +151,11 @@ pub trait RuntimeBinding: Send {
     /// Creates a controller for this runtime binding.
     fn controller(&self) -> Box<dyn Controller>;
 
+    /// Returns the currently reported processing latency in samples.
+    fn latency_samples(&self) -> u32 {
+        0
+    }
+
     /// Updates the runtime binding in place from a new slot state.
     fn update_in_place(&self, _slot: &SlotState) -> Result<bool, ProcessorStateError> {
         Ok(false)
@@ -277,6 +282,10 @@ pub trait Processor: Send {
     fn load_state(&mut self, state: &ProcessorState) -> Result<(), ProcessorStateError>;
     /// Resets transient runtime state.
     fn reset(&mut self);
+    /// Returns the currently reported processing latency in samples.
+    fn latency_samples(&self) -> u32 {
+        0
+    }
     /// Creates a live editor session for the processor, when supported.
     fn create_editor_session(&self) -> Result<Option<Box<dyn EditorSession>>, EditorError> {
         Ok(None)

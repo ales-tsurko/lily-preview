@@ -730,6 +730,7 @@ impl MixerRuntime {
         track_id: TrackId,
     ) -> Result<(), MixerRuntimeError> {
         let bus_inputs = self.bus_input_nodes();
+        let pdc_plan = self.pdc_plan(mixer);
         let track = mixer.track(track_id)?;
         let runtime_slot = self
             .tracks
@@ -757,14 +758,12 @@ impl MixerRuntime {
             return Ok(());
         }
         if let Some(runtime) = runtime_slot.as_mut() {
-            runtime.sync_routing(
-                context,
-                commands,
-                mixer,
-                self.master.input_node(),
-                &bus_inputs,
-                track,
-            )?;
+            let targets = RoutingTargets {
+                master_input: self.master.input_node(),
+                bus_inputs: &bus_inputs,
+                pdc_plan: &pdc_plan,
+            };
+            runtime.sync_routing(context, commands, mixer, targets, track)?;
         }
         Ok(())
     }
@@ -777,19 +776,18 @@ impl MixerRuntime {
         bus_id: BusId,
     ) -> Result<(), MixerRuntimeError> {
         let bus_inputs = self.bus_input_nodes();
+        let pdc_plan = self.pdc_plan(mixer);
         let bus = mixer.bus(bus_id)?;
         let runtime = self
             .buses
             .get_mut(&bus_id)
             .ok_or(MixerError::InvalidBusId(bus_id))?;
-        runtime.sync_routing(
-            context,
-            commands,
-            mixer,
-            self.master.input_node(),
-            &bus_inputs,
-            bus,
-        )?;
+        let targets = RoutingTargets {
+            master_input: self.master.input_node(),
+            bus_inputs: &bus_inputs,
+            pdc_plan: &pdc_plan,
+        };
+        runtime.sync_routing(context, commands, mixer, targets, bus)?;
         Ok(())
     }
 
@@ -799,12 +797,29 @@ impl MixerRuntime {
         commands: &mut MultiThreadedKnystCommands,
         mixer: &MixerState,
     ) -> Result<(), MixerRuntimeError> {
-        for (track_id, _) in mixer.tracks_with_ids() {
-            self.sync_track_routing(context, commands, mixer, track_id)?;
+        let bus_inputs = self.bus_input_nodes();
+        let pdc_plan = self.pdc_plan(mixer);
+        let targets = RoutingTargets {
+            master_input: self.master.input_node(),
+            bus_inputs: &bus_inputs,
+            pdc_plan: &pdc_plan,
+        };
+        for (track_id, track) in mixer.tracks_with_ids() {
+            if let Some(runtime) = self
+                .tracks
+                .get_mut(track_id.index())
+                .ok_or(MixerError::InvalidTrackId(track_id))?
+                .as_mut()
+            {
+                runtime.sync_routing(context, commands, mixer, targets, track)?;
+            }
         }
         let bus_ids: Vec<_> = mixer.buses_with_ids().map(|(bus_id, _)| bus_id).collect();
         for bus_id in bus_ids {
-            self.sync_bus_routing(context, commands, mixer, bus_id)?;
+            let bus = mixer.bus(bus_id)?;
+            if let Some(runtime) = self.buses.get_mut(&bus_id) {
+                runtime.sync_routing(context, commands, mixer, targets, bus)?;
+            }
         }
         self.sync_all_levels(mixer);
         Ok(())
@@ -816,30 +831,24 @@ impl MixerRuntime {
         mixer: &MixerState,
     ) -> Result<(), MixerRuntimeError> {
         let bus_inputs = self.bus_input_nodes();
+        let pdc_plan = self.pdc_plan(mixer);
+        let targets = RoutingTargets {
+            master_input: self.master.input_node(),
+            bus_inputs: &bus_inputs,
+            pdc_plan: &pdc_plan,
+        };
         for (track_id, track) in mixer.tracks_with_ids() {
             let runtime = self
                 .tracks
                 .get_mut(track_id.index())
                 .ok_or(MixerError::InvalidTrackId(track_id))?;
             if let Some(runtime) = runtime.as_mut() {
-                runtime.sync_routing_existing(
-                    commands,
-                    mixer,
-                    self.master.input_node(),
-                    &bus_inputs,
-                    track,
-                )?;
+                runtime.sync_routing_existing(commands, mixer, targets, track)?;
             }
         }
         for (bus_id, bus) in mixer.buses_with_ids() {
             if let Some(runtime) = self.buses.get_mut(&bus_id) {
-                runtime.sync_routing_existing(
-                    commands,
-                    mixer,
-                    self.master.input_node(),
-                    &bus_inputs,
-                    bus,
-                )?;
+                runtime.sync_routing_existing(commands, mixer, targets, bus)?;
             }
         }
         Ok(())
@@ -876,6 +885,161 @@ impl MixerRuntime {
             .iter()
             .map(|(bus_id, runtime)| (*bus_id, runtime.input_node()))
             .collect()
+    }
+
+    fn pdc_plan(&self, mixer: &MixerState) -> PdcPlan {
+        let track_latencies = mixer
+            .tracks_with_ids()
+            .map(|(track_id, track)| {
+                let latency = self
+                    .tracks
+                    .get(track_id.index())
+                    .and_then(|runtime| runtime.as_ref())
+                    .map_or_else(StripLatency::default, |runtime| runtime.latencies(track));
+                (track_id, latency)
+            })
+            .collect();
+        let bus_effect_latencies = mixer
+            .buses_with_ids()
+            .map(|(bus_id, bus)| {
+                let latency = self
+                    .buses
+                    .get(&bus_id)
+                    .map_or(0, |runtime| runtime.latencies(bus, 0).output);
+                (bus_id, latency)
+            })
+            .collect();
+        compute_pdc_plan_from_latencies(mixer, &track_latencies, &bus_effect_latencies)
+    }
+}
+
+fn compute_pdc_plan_from_latencies(
+    mixer: &MixerState,
+    track_latencies: &HashMap<TrackId, StripLatency>,
+    bus_effect_latencies: &HashMap<BusId, u32>,
+) -> PdcPlan {
+    let mut plan = PdcPlan::default();
+    for (bus_id, _) in mixer.buses_with_ids() {
+        plan.bus_input_latencies.insert(bus_id, 0);
+    }
+
+    for _ in 0..=mixer.buses().len() {
+        let next_bus_inputs =
+            compute_bus_input_latencies(mixer, track_latencies, bus_effect_latencies, &plan);
+        if next_bus_inputs == plan.bus_input_latencies {
+            break;
+        }
+        plan.bus_input_latencies = next_bus_inputs;
+    }
+    plan.master_input_latency =
+        compute_master_input_latency(mixer, track_latencies, bus_effect_latencies, &plan);
+    plan
+}
+
+fn compute_bus_input_latencies(
+    mixer: &MixerState,
+    track_latencies: &HashMap<TrackId, StripLatency>,
+    bus_effect_latencies: &HashMap<BusId, u32>,
+    plan: &PdcPlan,
+) -> HashMap<BusId, u32> {
+    let mut latencies: HashMap<BusId, u32> = mixer
+        .buses_with_ids()
+        .map(|(bus_id, _)| (bus_id, 0))
+        .collect();
+
+    for (track_id, track) in mixer.tracks_with_ids() {
+        let strip_latency = track_latencies.get(&track_id).copied().unwrap_or_default();
+        collect_bus_input_latency(&mut latencies, track.routing.main, strip_latency.output);
+        collect_send_input_latencies(&mut latencies, &track.routing.sends, strip_latency);
+    }
+
+    for (bus_id, bus) in mixer.buses_with_ids() {
+        let strip_latency = bus_strip_latency(
+            plan.bus_input_latency(bus_id),
+            bus_effect_latencies
+                .get(&bus_id)
+                .copied()
+                .unwrap_or_default(),
+        );
+        collect_bus_input_latency(&mut latencies, bus.routing.main, strip_latency.output);
+        collect_send_input_latencies(&mut latencies, &bus.routing.sends, strip_latency);
+    }
+
+    latencies
+}
+
+fn compute_master_input_latency(
+    mixer: &MixerState,
+    track_latencies: &HashMap<TrackId, StripLatency>,
+    bus_effect_latencies: &HashMap<BusId, u32>,
+    plan: &PdcPlan,
+) -> u32 {
+    let mut latency = 0;
+    for (track_id, track) in mixer.tracks_with_ids() {
+        if track.routing.main == TrackRoute::Master {
+            latency = latency.max(
+                track_latencies
+                    .get(&track_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .output,
+            );
+        }
+    }
+    for (bus_id, bus) in mixer.buses_with_ids() {
+        if bus.routing.main == TrackRoute::Master {
+            latency = latency.max(
+                bus_strip_latency(
+                    plan.bus_input_latency(bus_id),
+                    bus_effect_latencies
+                        .get(&bus_id)
+                        .copied()
+                        .unwrap_or_default(),
+                )
+                .output,
+            );
+        }
+    }
+    latency
+}
+
+fn collect_send_input_latencies(
+    latencies: &mut HashMap<BusId, u32>,
+    sends: &[BusSend],
+    strip_latency: StripLatency,
+) {
+    for send in sends {
+        if send.enabled {
+            let source_latency = if send.pre_fader {
+                strip_latency.pre_fader
+            } else {
+                strip_latency.post_fader
+            };
+            latencies
+                .entry(send.bus_id)
+                .and_modify(|latency| *latency = (*latency).max(source_latency));
+        }
+    }
+}
+
+fn bus_strip_latency(input_latency: u32, effect_latency: u32) -> StripLatency {
+    let post_fader = input_latency.saturating_add(effect_latency);
+    StripLatency {
+        pre_fader: input_latency,
+        post_fader,
+        output: post_fader,
+    }
+}
+
+fn collect_bus_input_latency(
+    latencies: &mut HashMap<BusId, u32>,
+    route: TrackRoute,
+    source_latency: u32,
+) {
+    if let TrackRoute::Bus(bus_id) = route {
+        latencies
+            .entry(bus_id)
+            .and_modify(|latency| *latency = (*latency).max(source_latency));
     }
 }
 
@@ -1001,6 +1165,7 @@ struct TrackRuntime {
     meter: SharedStripMeter,
     level: SharedStripLevel,
     route_bus: Handle<GenericHandle>,
+    route_delay_node: Option<NodeId>,
     instrument: Option<TrackInstrumentRuntime>,
     send_nodes: Vec<NodeId>,
     signal_path: TrackSignalPath,
@@ -1016,7 +1181,85 @@ struct TrackRuntimeBuildContext<'a> {
     soundfont_settings: SoundfontSynthSettings,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StripLatency {
+    pre_fader: u32,
+    post_fader: u32,
+    output: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PdcPlan {
+    master_input_latency: u32,
+    bus_input_latencies: HashMap<BusId, u32>,
+}
+
+impl PdcPlan {
+    fn destination_latency(&self, route: TrackRoute) -> u32 {
+        match route {
+            TrackRoute::Master => self.master_input_latency,
+            TrackRoute::Bus(bus_id) => self.bus_input_latencies.get(&bus_id).copied().unwrap_or(0),
+        }
+    }
+
+    fn bus_input_latency(&self, bus_id: BusId) -> u32 {
+        self.bus_input_latencies.get(&bus_id).copied().unwrap_or(0)
+    }
+
+    fn route_delay(&self, route: TrackRoute, source_latency: u32) -> u32 {
+        self.destination_latency(route)
+            .saturating_sub(source_latency)
+    }
+
+    fn bus_send_delay(&self, bus_id: BusId, source_latency: u32) -> u32 {
+        self.bus_input_latency(bus_id)
+            .saturating_sub(source_latency)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RoutingTargets<'a> {
+    master_input: NodeId,
+    bus_inputs: &'a HashMap<BusId, NodeId>,
+    pdc_plan: &'a PdcPlan,
+}
+
+#[derive(Clone, Copy)]
+struct LatentNode {
+    node: NodeId,
+    latency: u32,
+}
+
+struct SendRouting<'a> {
+    bus_inputs: &'a HashMap<BusId, NodeId>,
+    pdc_plan: &'a PdcPlan,
+    sends: &'a [BusSend],
+    pre_source: LatentNode,
+    post_source: LatentNode,
+}
+
 impl TrackRuntime {
+    fn latencies(&self, track: &Track) -> StripLatency {
+        let instrument_latency = self
+            .instrument
+            .as_ref()
+            .map_or(0, TrackInstrumentRuntime::latency_samples);
+        let effects_latency = self
+            .effects
+            .iter()
+            .zip(track.effect_states())
+            .filter(|(_, slot)| !slot.bypassed)
+            .filter_map(|(runtime, _)| runtime.as_ref())
+            .map(EffectRuntime::latency_samples)
+            .sum::<u32>();
+        let post_fader = instrument_latency.saturating_add(effects_latency);
+        StripLatency {
+            pre_fader: instrument_latency,
+            post_fader,
+            output: post_fader,
+        }
+    }
+
     fn pre_send_source_node(&self) -> NodeId {
         match &self.signal_path {
             TrackSignalPath::Separated { source_bus, .. } => node_id_of(*source_bus),
@@ -1083,6 +1326,7 @@ impl TrackRuntime {
             meter,
             level,
             route_bus,
+            route_delay_node: None,
             instrument,
             send_nodes: Vec::new(),
             signal_path,
@@ -1098,14 +1342,13 @@ impl TrackRuntime {
                 build.soundfont_settings,
             )?;
         }
-        runtime.sync_routing(
-            context,
-            commands,
-            build.mixer,
-            build.master_input,
-            build.bus_inputs,
-            track,
-        )?;
+        let pdc_plan = PdcPlan::default();
+        let targets = RoutingTargets {
+            master_input: build.master_input,
+            bus_inputs: build.bus_inputs,
+            pdc_plan: &pdc_plan,
+        };
+        runtime.sync_routing(context, commands, build.mixer, targets, track)?;
         Ok(runtime)
     }
 
@@ -1220,20 +1463,27 @@ impl TrackRuntime {
         context: &KnystContext,
         commands: &mut MultiThreadedKnystCommands,
         mixer: &MixerState,
-        master_input: NodeId,
-        bus_inputs: &HashMap<BusId, NodeId>,
+        targets: RoutingTargets<'_>,
         track: &Track,
     ) -> Result<(), MixerRuntimeError> {
-        context.with_activation(|| {
-            self.sync_routing_existing(commands, mixer, master_input, bus_inputs, track)
-        })?;
+        context.with_activation(|| self.sync_routing_existing(commands, mixer, targets, track))?;
+        let strip_latency = self.latencies(track);
         self.rebuild_sends(
             context,
             commands,
-            bus_inputs,
-            &track.routing.sends,
-            self.pre_send_source_node(),
-            self.post_send_source_node(),
+            SendRouting {
+                bus_inputs: targets.bus_inputs,
+                pdc_plan: targets.pdc_plan,
+                sends: &track.routing.sends,
+                pre_source: LatentNode {
+                    node: self.pre_send_source_node(),
+                    latency: strip_latency.pre_fader,
+                },
+                post_source: LatentNode {
+                    node: self.post_send_source_node(),
+                    latency: strip_latency.post_fader,
+                },
+            },
         );
         Ok(())
     }
@@ -1242,13 +1492,22 @@ impl TrackRuntime {
         &mut self,
         _commands: &mut MultiThreadedKnystCommands,
         mixer: &MixerState,
-        master_input: NodeId,
-        bus_inputs: &HashMap<BusId, NodeId>,
+        targets: RoutingTargets<'_>,
         track: &Track,
     ) -> Result<(), MixerRuntimeError> {
-        let destination = destination_node(track.routing.main, master_input, bus_inputs, mixer)?;
+        let destination = destination_node(
+            track.routing.main,
+            targets.master_input,
+            targets.bus_inputs,
+            mixer,
+        )?;
         knyst_commands().disconnect(Connection::clear_to_nodes(node_id_of(self.route_bus)));
-        connect_stereo(node_id_of(self.route_bus), destination);
+        free_optional_node(self.route_delay_node.take());
+        let delay = targets
+            .pdc_plan
+            .route_delay(track.routing.main, self.latencies(track).output);
+        self.route_delay_node =
+            connect_stereo_with_delay(_commands, node_id_of(self.route_bus), destination, delay);
         Ok(())
     }
 
@@ -1256,23 +1515,18 @@ impl TrackRuntime {
         &mut self,
         context: &KnystContext,
         commands: &mut MultiThreadedKnystCommands,
-        bus_inputs: &HashMap<BusId, NodeId>,
-        sends: &[BusSend],
-        pre_source: NodeId,
-        post_source: NodeId,
+        routing: SendRouting<'_>,
     ) {
         for node in self.send_nodes.drain(..) {
-            knyst_commands().disconnect(Connection::clear_from_nodes(node));
-            knyst_commands().disconnect(Connection::clear_to_nodes(node));
-            knyst_commands().free_node(node);
+            free_node(node);
         }
 
         context.with_activation(|| {
-            for send in sends {
+            for send in routing.sends {
                 if !send.enabled {
                     continue;
                 }
-                let Some(destination) = bus_inputs.get(&send.bus_id).copied() else {
+                let Some(destination) = routing.bus_inputs.get(&send.bus_id).copied() else {
                     continue;
                 };
                 let gain = handle_with_inputs(
@@ -1281,15 +1535,18 @@ impl TrackRuntime {
                     inputs!((2 : db_to_amplitude(send.gain_db))),
                 );
                 let gain_node = node_id_of(gain);
-                connect_stereo(
-                    if send.pre_fader {
-                        pre_source
-                    } else {
-                        post_source
-                    },
-                    gain_node,
-                );
-                connect_stereo(gain_node, destination);
+                let source = if send.pre_fader {
+                    routing.pre_source
+                } else {
+                    routing.post_source
+                };
+                connect_stereo(source.node, gain_node);
+                let delay = routing.pdc_plan.bus_send_delay(send.bus_id, source.latency);
+                if let Some(delay_node) =
+                    connect_stereo_with_delay(commands, gain_node, destination, delay)
+                {
+                    self.send_nodes.push(delay_node);
+                }
                 self.send_nodes.push(gain_node);
             }
         });
@@ -1303,10 +1560,9 @@ impl TrackRuntime {
             free_effect(effect);
         }
         for node in self.send_nodes {
-            knyst_commands().disconnect(Connection::clear_from_nodes(node));
-            knyst_commands().disconnect(Connection::clear_to_nodes(node));
-            knyst_commands().free_node(node);
+            free_node(node);
         }
+        free_optional_node(self.route_delay_node);
         knyst_commands().disconnect(Connection::clear_from_nodes(node_id_of(self.route_bus)));
         knyst_commands().disconnect(Connection::clear_to_nodes(node_id_of(self.route_bus)));
         self.signal_path.free();
@@ -1341,6 +1597,7 @@ impl TrackSignalPath {
 struct TrackInstrumentRuntime {
     handle: InstrumentRuntimeHandle,
     binding: Box<dyn RuntimeBinding>,
+    processor_latency_samples: u32,
 }
 
 impl TrackInstrumentRuntime {
@@ -1365,11 +1622,18 @@ impl TrackInstrumentRuntime {
     fn controller(&self) -> Box<dyn Controller> {
         self.binding.controller()
     }
+
+    fn latency_samples(&self) -> u32 {
+        self.binding
+            .latency_samples()
+            .max(self.processor_latency_samples)
+    }
 }
 
 struct EffectRuntime {
     handle: EffectRuntimeHandle,
     binding: Option<Box<dyn RuntimeBinding>>,
+    processor_latency_samples: u32,
 }
 
 impl EffectRuntime {
@@ -1380,14 +1644,26 @@ impl EffectRuntime {
     fn controller(&self) -> Option<Box<dyn Controller>> {
         self.binding.as_ref().map(|binding| binding.controller())
     }
+
+    fn latency_samples(&self) -> u32 {
+        self.binding
+            .as_ref()
+            .map_or(self.processor_latency_samples, |binding| {
+                binding
+                    .latency_samples()
+                    .max(self.processor_latency_samples)
+            })
+    }
 }
 
 fn create_effect_runtime(effect: &SlotState) -> Option<EffectRuntime> {
     let spec = build_effect_runtime_spec(effect).ok()??;
+    let processor_latency_samples = spec.processor.latency_samples();
     let node = handle(EffectProcessorNode::new(spec.processor));
     Some(EffectRuntime {
         handle: EffectRuntimeHandle::new(node),
         binding: spec.binding,
+        processor_latency_samples,
     })
 }
 
@@ -1405,10 +1681,28 @@ struct BusRuntime {
     meter: SharedStripMeter,
     level: SharedStripLevel,
     route_bus: Handle<GenericHandle>,
+    route_delay_node: Option<NodeId>,
     send_nodes: Vec<NodeId>,
 }
 
 impl BusRuntime {
+    fn latencies(&self, bus_track: &Track, input_latency: u32) -> StripLatency {
+        let effects_latency = self
+            .effects
+            .iter()
+            .zip(bus_track.effect_states())
+            .filter(|(_, slot)| !slot.bypassed)
+            .filter_map(|(runtime, _)| runtime.as_ref())
+            .map(EffectRuntime::latency_samples)
+            .sum::<u32>();
+        let post_fader = input_latency.saturating_add(effects_latency);
+        StripLatency {
+            pre_fader: input_latency,
+            post_fader,
+            output: post_fader,
+        }
+    }
+
     fn new(
         context: &KnystContext,
         commands: &mut MultiThreadedKnystCommands,
@@ -1437,6 +1731,7 @@ impl BusRuntime {
             meter,
             level,
             route_bus,
+            route_delay_node: None,
             send_nodes: Vec::new(),
         };
         runtime.rebuild_effects(context, commands, bus_track);
@@ -1481,20 +1776,31 @@ impl BusRuntime {
         context: &KnystContext,
         commands: &mut MultiThreadedKnystCommands,
         mixer: &MixerState,
-        master_input: NodeId,
-        bus_inputs: &HashMap<BusId, NodeId>,
+        targets: RoutingTargets<'_>,
         bus_track: &Track,
     ) -> Result<(), MixerRuntimeError> {
-        context.with_activation(|| {
-            self.sync_routing_existing(commands, mixer, master_input, bus_inputs, bus_track)
-        })?;
+        context
+            .with_activation(|| self.sync_routing_existing(commands, mixer, targets, bus_track))?;
+        let Some(bus_id) = bus_track.bus_id else {
+            return Ok(());
+        };
+        let strip_latency = self.latencies(bus_track, targets.pdc_plan.bus_input_latency(bus_id));
         self.rebuild_sends(
             context,
             commands,
-            bus_inputs,
-            &bus_track.routing.sends,
-            node_id_of(self.input),
-            node_id_of(self.strip),
+            SendRouting {
+                bus_inputs: targets.bus_inputs,
+                pdc_plan: targets.pdc_plan,
+                sends: &bus_track.routing.sends,
+                pre_source: LatentNode {
+                    node: node_id_of(self.input),
+                    latency: strip_latency.pre_fader,
+                },
+                post_source: LatentNode {
+                    node: node_id_of(self.strip),
+                    latency: strip_latency.post_fader,
+                },
+            },
         );
         Ok(())
     }
@@ -1503,14 +1809,27 @@ impl BusRuntime {
         &mut self,
         _commands: &mut MultiThreadedKnystCommands,
         mixer: &MixerState,
-        master_input: NodeId,
-        bus_inputs: &HashMap<BusId, NodeId>,
+        targets: RoutingTargets<'_>,
         bus_track: &Track,
     ) -> Result<(), MixerRuntimeError> {
-        let destination =
-            destination_node(bus_track.routing.main, master_input, bus_inputs, mixer)?;
+        let destination = destination_node(
+            bus_track.routing.main,
+            targets.master_input,
+            targets.bus_inputs,
+            mixer,
+        )?;
         knyst_commands().disconnect(Connection::clear_to_nodes(node_id_of(self.route_bus)));
-        connect_stereo(node_id_of(self.route_bus), destination);
+        free_optional_node(self.route_delay_node.take());
+        let Some(bus_id) = bus_track.bus_id else {
+            return Ok(());
+        };
+        let delay = targets.pdc_plan.route_delay(
+            bus_track.routing.main,
+            self.latencies(bus_track, targets.pdc_plan.bus_input_latency(bus_id))
+                .output,
+        );
+        self.route_delay_node =
+            connect_stereo_with_delay(_commands, node_id_of(self.route_bus), destination, delay);
         Ok(())
     }
 
@@ -1518,23 +1837,18 @@ impl BusRuntime {
         &mut self,
         context: &KnystContext,
         commands: &mut MultiThreadedKnystCommands,
-        bus_inputs: &HashMap<BusId, NodeId>,
-        sends: &[BusSend],
-        pre_source: NodeId,
-        post_source: NodeId,
+        routing: SendRouting<'_>,
     ) {
         for node in self.send_nodes.drain(..) {
-            knyst_commands().disconnect(Connection::clear_from_nodes(node));
-            knyst_commands().disconnect(Connection::clear_to_nodes(node));
-            knyst_commands().free_node(node);
+            free_node(node);
         }
 
         context.with_activation(|| {
-            for send in sends {
+            for send in routing.sends {
                 if !send.enabled {
                     continue;
                 }
-                let Some(destination) = bus_inputs.get(&send.bus_id).copied() else {
+                let Some(destination) = routing.bus_inputs.get(&send.bus_id).copied() else {
                     continue;
                 };
                 let gain = handle_with_inputs(
@@ -1543,15 +1857,18 @@ impl BusRuntime {
                     inputs!((2 : db_to_amplitude(send.gain_db))),
                 );
                 let gain_node = node_id_of(gain);
-                connect_stereo(
-                    if send.pre_fader {
-                        pre_source
-                    } else {
-                        post_source
-                    },
-                    gain_node,
-                );
-                connect_stereo(gain_node, destination);
+                let source = if send.pre_fader {
+                    routing.pre_source
+                } else {
+                    routing.post_source
+                };
+                connect_stereo(source.node, gain_node);
+                let delay = routing.pdc_plan.bus_send_delay(send.bus_id, source.latency);
+                if let Some(delay_node) =
+                    connect_stereo_with_delay(commands, gain_node, destination, delay)
+                {
+                    self.send_nodes.push(delay_node);
+                }
                 self.send_nodes.push(gain_node);
             }
         });
@@ -1562,10 +1879,9 @@ impl BusRuntime {
             free_effect(effect);
         }
         for node in self.send_nodes {
-            knyst_commands().disconnect(Connection::clear_from_nodes(node));
-            knyst_commands().disconnect(Connection::clear_to_nodes(node));
-            knyst_commands().free_node(node);
+            free_node(node);
         }
+        free_optional_node(self.route_delay_node);
         knyst_commands().disconnect(Connection::clear_from_nodes(node_id_of(self.strip)));
         knyst_commands().disconnect(Connection::clear_to_nodes(node_id_of(self.strip)));
         knyst_commands().disconnect(Connection::clear_from_nodes(node_id_of(self.route_bus)));
@@ -1616,6 +1932,7 @@ fn create_track_instrument(
         return Ok(None);
     };
     let crate::instrument::InstrumentRuntimeSpec { processor, binding } = spec;
+    let processor_latency_samples = processor.latency_samples();
     let node = context.with_activation(|| {
         let reset_state = SharedInstrumentResetState::default();
         let node = if let Some((level, meter)) = inline_strip {
@@ -1633,6 +1950,7 @@ fn create_track_instrument(
     Ok(Some(TrackInstrumentRuntime {
         handle: node,
         binding,
+        processor_latency_samples,
     }))
 }
 
@@ -1657,6 +1975,40 @@ fn destination_node(
 fn connect_stereo(source: NodeId, destination: NodeId) {
     knyst_commands().connect(source.to(destination).from_index(0).to_index(0));
     knyst_commands().connect(source.to(destination).from_index(1).to_index(1));
+}
+
+fn connect_stereo_with_delay(
+    commands: &mut MultiThreadedKnystCommands,
+    source: NodeId,
+    destination: NodeId,
+    delay_samples: u32,
+) -> Option<NodeId> {
+    if delay_samples == 0 {
+        connect_stereo(source, destination);
+        return None;
+    }
+
+    let delay = handle_with_inputs(
+        commands,
+        StereoDelay::new(delay_samples as usize),
+        inputs!(),
+    );
+    let delay_node = node_id_of(delay);
+    connect_stereo(source, delay_node);
+    connect_stereo(delay_node, destination);
+    Some(delay_node)
+}
+
+fn free_optional_node(node: Option<NodeId>) {
+    if let Some(node) = node {
+        free_node(node);
+    }
+}
+
+fn free_node(node: NodeId) {
+    knyst_commands().disconnect(Connection::clear_from_nodes(node));
+    knyst_commands().disconnect(Connection::clear_to_nodes(node));
+    knyst_commands().free_node(node);
 }
 
 fn handle_with_inputs(
@@ -1880,6 +2232,46 @@ impl StereoGain {
     }
 }
 
+struct StereoDelay {
+    delay_samples: usize,
+    left: Vec<Sample>,
+    right: Vec<Sample>,
+    cursor: usize,
+}
+
+#[impl_gen]
+impl StereoDelay {
+    #[new]
+    fn new(delay_samples: usize) -> Self {
+        let delay_samples = delay_samples.max(1);
+        Self {
+            delay_samples,
+            left: vec![0.0; delay_samples],
+            right: vec![0.0; delay_samples],
+            cursor: 0,
+        }
+    }
+
+    #[process]
+    fn process(
+        &mut self,
+        left_in: &[Sample],
+        right_in: &[Sample],
+        left_out: &mut [Sample],
+        right_out: &mut [Sample],
+        block_size: BlockSize,
+    ) -> GenState {
+        for frame in 0..block_size.0 {
+            left_out[frame] = self.left[self.cursor];
+            right_out[frame] = self.right[self.cursor];
+            self.left[self.cursor] = left_in[frame];
+            self.right[self.cursor] = right_in[frame];
+            self.cursor = (self.cursor + 1) % self.delay_samples;
+        }
+        GenState::Continue
+    }
+}
+
 #[cfg(test)]
 pub(super) struct StereoBalanceGain {
     level: SharedStripLevel,
@@ -2093,6 +2485,10 @@ impl knyst::r#gen::Gen for TrackInstrumentStripNode {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use knyst::controller::KnystCommands;
     use knyst::inputs;
     use knyst::modal_interface::knyst_commands;
@@ -2102,19 +2498,23 @@ mod tests {
     use wide::f32x4;
 
     use super::{
-        InstrumentProcessorNode, InstrumentRuntimeHandle, MasterRuntime, MeterTap,
+        InstrumentProcessorNode, InstrumentRuntimeHandle, MasterRuntime, MeterTap, MixerRuntime,
         MixerRuntimeError, RuntimeFactoryError, SharedInstrumentResetState, SharedStripMeter,
-        connect_stereo, db_to_amplitude, node_id_of, normalize_meter_level,
+        StripLatency, compute_pdc_plan_from_latencies, connect_stereo, db_to_amplitude, node_id_of,
+        normalize_meter_level,
     };
     use crate::instrument::registry::Entry;
     use crate::instrument::{
-        BUILTIN_SOUNDFONT_ID, Controller, ControllerError, InstrumentProcessor,
-        InstrumentRuntimeContext, InstrumentRuntimeSpec, MidiEvent, Processor, ProcessorDescriptor,
-        ProcessorKind, ProcessorState, ProcessorStateError, RuntimeBinding, SlotState, registry,
+        BUILTIN_SOUNDFONT_ID, Controller, ControllerError, EffectProcessor, EffectRuntimeSpec,
+        InstrumentProcessor, InstrumentRuntimeContext, InstrumentRuntimeSpec, MidiEvent, Processor,
+        ProcessorDescriptor, ProcessorKind, ProcessorState, ProcessorStateError, RuntimeBinding,
+        SlotState, registry,
     };
-    use crate::mixer::{BusSend, Mixer, MixerState, TrackId};
+    use crate::mixer::{BusSend, Mixer, MixerState, SlotAddress, TrackId, TrackRoute};
     use crate::test_utils::{OfflineHarness, test_soundfont_resource};
     use knyst::time::Beats;
+
+    const TEST_LATENCY_EFFECT_ID: &str = "org.lilypalooza.test.latency-effect";
 
     fn schedule_test_note(harness: &mut OfflineHarness, handle: InstrumentRuntimeHandle) {
         let scheduled_at = harness
@@ -2144,6 +2544,11 @@ mod tests {
         SlotState::built_in(BUILTIN_SOUNDFONT_ID, ProcessorState(vec![program]))
     }
 
+    fn latency_effect_slot() -> SlotState {
+        register_test_latency_effect_builtin();
+        SlotState::built_in(TEST_LATENCY_EFFECT_ID, ProcessorState::default())
+    }
+
     fn register_test_soundfont_builtin() {
         registry::register([Entry::builtin_instrument(
             BUILTIN_SOUNDFONT_ID,
@@ -2153,9 +2558,27 @@ mod tests {
         )]);
     }
 
+    fn register_test_latency_effect_builtin() {
+        registry::register([Entry::builtin_effect(
+            TEST_LATENCY_EFFECT_ID,
+            "Latency",
+            test_latency_effect_descriptor(),
+            create_test_latency_effect_runtime,
+        )]);
+    }
+
     fn test_instrument_descriptor() -> &'static ProcessorDescriptor {
         static DESCRIPTOR: ProcessorDescriptor = ProcessorDescriptor {
             name: "Test Instrument",
+            params: &[],
+            editor: None,
+        };
+        &DESCRIPTOR
+    }
+
+    fn test_latency_effect_descriptor() -> &'static ProcessorDescriptor {
+        static DESCRIPTOR: ProcessorDescriptor = ProcessorDescriptor {
+            name: "Latency",
             params: &[],
             editor: None,
         };
@@ -2176,6 +2599,22 @@ mod tests {
         Ok(Some(InstrumentRuntimeSpec {
             processor: Box::<TestInstrumentProcessor>::default(),
             binding: Box::new(TestInstrumentBinding),
+        }))
+    }
+
+    fn create_test_latency_effect_runtime(
+        slot: &SlotState,
+    ) -> Result<Option<EffectRuntimeSpec>, RuntimeFactoryError> {
+        if !matches!(
+            slot.kind,
+            ProcessorKind::BuiltIn { ref processor_id } if processor_id == TEST_LATENCY_EFFECT_ID
+        ) {
+            return Ok(None);
+        }
+        let latency = Arc::new(AtomicU32::new(0));
+        Ok(Some(EffectRuntimeSpec {
+            processor: Box::new(TestLatencyEffect),
+            binding: Some(Box::new(TestLatencyEffectBinding { latency })),
         }))
     }
 
@@ -2235,6 +2674,111 @@ mod tests {
 
         fn is_sleeping(&self) -> bool {
             !self.active
+        }
+    }
+
+    struct TestLatencyEffect;
+
+    impl Processor for TestLatencyEffect {
+        fn descriptor(&self) -> &'static ProcessorDescriptor {
+            test_latency_effect_descriptor()
+        }
+
+        fn set_param(&mut self, id: &str, normalized: f32) -> bool {
+            id.is_empty() && normalized == 0.0
+        }
+
+        fn get_param(&self, id: &str) -> Option<f32> {
+            (id.is_empty()).then_some(0.0)
+        }
+
+        fn save_state(&self) -> ProcessorState {
+            ProcessorState::default()
+        }
+
+        fn load_state(&mut self, state: &ProcessorState) -> Result<(), ProcessorStateError> {
+            if state.0.is_empty() {
+                Ok(())
+            } else {
+                Err(ProcessorStateError::Decode(
+                    "test latency effect state must be empty".to_string(),
+                ))
+            }
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    impl EffectProcessor for TestLatencyEffect {
+        fn process(
+            &mut self,
+            left: &[f32],
+            right: &[f32],
+            left_out: &mut [f32],
+            right_out: &mut [f32],
+        ) {
+            left_out.copy_from_slice(left);
+            right_out.copy_from_slice(right);
+        }
+    }
+
+    struct TestLatencyEffectBinding {
+        latency: Arc<AtomicU32>,
+    }
+
+    impl RuntimeBinding for TestLatencyEffectBinding {
+        fn controller(&self) -> Box<dyn Controller> {
+            Box::new(TestLatencyEffectController {
+                latency: Arc::clone(&self.latency),
+            })
+        }
+
+        fn latency_samples(&self) -> u32 {
+            self.latency.load(Ordering::Relaxed)
+        }
+    }
+
+    struct TestLatencyEffectController {
+        latency: Arc<AtomicU32>,
+    }
+
+    impl Controller for TestLatencyEffectController {
+        fn descriptor(&self) -> &'static ProcessorDescriptor {
+            test_latency_effect_descriptor()
+        }
+
+        fn get_param(&self, id: &str) -> Result<f32, ControllerError> {
+            if id == "latency_samples" {
+                Ok(self.latency.load(Ordering::Relaxed) as f32 / 128.0)
+            } else {
+                Err(ControllerError::UnknownParameter(id.to_string()))
+            }
+        }
+
+        fn set_param(&self, id: &str, normalized: f32) -> Result<(), ControllerError> {
+            if id == "latency_samples" {
+                self.latency.store(
+                    (normalized.clamp(0.0, 1.0) * 128.0).round() as u32,
+                    Ordering::Relaxed,
+                );
+                Ok(())
+            } else {
+                Err(ControllerError::UnknownParameter(id.to_string()))
+            }
+        }
+
+        fn save_state(&self) -> Result<ProcessorState, ControllerError> {
+            Ok(ProcessorState::default())
+        }
+
+        fn load_state(&self, state: &ProcessorState) -> Result<(), ControllerError> {
+            if state.0.is_empty() {
+                Ok(())
+            } else {
+                Err(ControllerError::Backend(
+                    "test latency effect state must be empty".to_string(),
+                ))
+            }
         }
     }
 
@@ -2340,6 +2884,140 @@ mod tests {
     fn mixer_gain_floor_is_silence() {
         assert_eq!(db_to_amplitude(-60.0), 0.0);
         assert!(db_to_amplitude(-59.5) > 0.0);
+    }
+
+    #[test]
+    fn pdc_plan_delays_faster_direct_master_paths() {
+        let mixer = MixerState::new();
+        let track_latencies = HashMap::from([
+            (
+                TrackId(0),
+                StripLatency {
+                    pre_fader: 0,
+                    post_fader: 64,
+                    output: 64,
+                },
+            ),
+            (TrackId(1), StripLatency::default()),
+        ]);
+        let plan = compute_pdc_plan_from_latencies(&mixer, &track_latencies, &HashMap::new());
+
+        assert_eq!(plan.master_input_latency, 64);
+        assert_eq!(plan.route_delay(TrackRoute::Master, 0), 64);
+        assert_eq!(plan.route_delay(TrackRoute::Master, 64), 0);
+    }
+
+    #[test]
+    fn pdc_plan_uses_pre_or_post_send_source_latency() {
+        let mut mixer = MixerState::new();
+        let pre_bus = mixer.add_bus("Pre");
+        let post_bus = mixer.add_bus("Post");
+        mixer
+            .add_track_bus_send(
+                TrackId(0),
+                BusSend {
+                    bus_id: pre_bus,
+                    gain_db: 0.0,
+                    enabled: true,
+                    pre_fader: true,
+                },
+            )
+            .expect("pre send should be valid");
+        mixer
+            .add_track_bus_send(
+                TrackId(0),
+                BusSend {
+                    bus_id: post_bus,
+                    gain_db: 0.0,
+                    enabled: true,
+                    pre_fader: false,
+                },
+            )
+            .expect("post send should be valid");
+        let track_latencies = HashMap::from([(
+            TrackId(0),
+            StripLatency {
+                pre_fader: 10,
+                post_fader: 30,
+                output: 30,
+            },
+        )]);
+        let plan = compute_pdc_plan_from_latencies(&mixer, &track_latencies, &HashMap::new());
+
+        assert_eq!(plan.bus_input_latency(pre_bus), 10);
+        assert_eq!(plan.bus_input_latency(post_bus), 30);
+        assert_eq!(plan.bus_send_delay(pre_bus, 10), 0);
+        assert_eq!(plan.bus_send_delay(post_bus, 10), 20);
+    }
+
+    #[test]
+    fn pdc_plan_propagates_bus_effect_latency_to_master() {
+        let mut mixer = MixerState::new();
+        let bus = mixer.add_bus("Bus");
+        mixer
+            .set_track_route(TrackId(0), TrackRoute::Bus(bus))
+            .expect("track route should be valid");
+        let track_latencies = HashMap::from([(
+            TrackId(0),
+            StripLatency {
+                pre_fader: 0,
+                post_fader: 10,
+                output: 10,
+            },
+        )]);
+        let bus_effect_latencies = HashMap::from([(bus, 32)]);
+        let plan = compute_pdc_plan_from_latencies(&mixer, &track_latencies, &bus_effect_latencies);
+
+        assert_eq!(plan.bus_input_latency(bus), 10);
+        assert_eq!(plan.master_input_latency, 42);
+        assert_eq!(plan.route_delay(TrackRoute::Master, 0), 42);
+    }
+
+    #[test]
+    fn pdc_plan_uses_live_reported_latency_after_resync() {
+        let mut harness = OfflineHarness::new(44_100, 64);
+        let mut mixer = MixerState::new();
+        mixer
+            .track_mut(TrackId(0))
+            .expect("track 0 should exist")
+            .set_effects(vec![latency_effect_slot()]);
+        mixer
+            .track_mut(TrackId(1))
+            .expect("track 1 should exist")
+            .set_effects(vec![latency_effect_slot()]);
+        let context = harness.context().clone();
+        let settings = harness.settings();
+        let mut runtime = MixerRuntime::attach(&context, harness.commands(), &settings, &mixer)
+            .expect("runtime should attach");
+
+        assert_eq!(runtime.pdc_plan(&mixer).master_input_latency, 0);
+        let controller = runtime
+            .controller(
+                &mixer,
+                SlotAddress {
+                    strip_index: 1,
+                    slot_index: 1,
+                },
+            )
+            .expect("controller lookup should succeed")
+            .expect("latency effect should expose a controller");
+
+        controller
+            .set_param("latency_samples", 0.5)
+            .expect("latency update should be accepted");
+        assert_eq!(runtime.pdc_plan(&mixer).master_input_latency, 64);
+
+        runtime
+            .sync_all_routing(&context, harness.commands(), &mixer)
+            .expect("routing should resync after latency change");
+        assert!(
+            runtime.tracks[1]
+                .as_ref()
+                .expect("track 1 runtime should exist")
+                .route_delay_node
+                .is_some(),
+            "faster tracks need inserted compensation delay after latency change"
+        );
     }
 
     #[test]

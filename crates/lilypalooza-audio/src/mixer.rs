@@ -730,6 +730,14 @@ impl MixerHandle<'_> {
         Ok(removed)
     }
 
+    pub fn sync_processor_latencies(&mut self) -> Result<(), AudioEngineError> {
+        self.mixer
+            .runtime
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
+        settle_graph_mutation(self.commands);
+        Ok(())
+    }
+
     pub fn set_track_instrument(
         &mut self,
         id: TrackId,
@@ -745,14 +753,12 @@ impl MixerHandle<'_> {
             &self.mixer.state,
             id,
         )?;
-        if matches!(sync, TrackInstrumentSync::GraphChanged) {
-            self.mixer.runtime.sync_track_routing(
-                self.context,
-                self.commands,
-                &self.mixer.state,
-                id,
-            )?;
-            settle_graph_mutation(self.commands);
+        let graph_changed = matches!(sync, TrackInstrumentSync::GraphChanged);
+        self.mixer
+            .runtime
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
+        settle_graph_mutation(self.commands);
+        if graph_changed {
             self.sequencer
                 .sync_track_handle(self.commands, id, self.mixer.instrument_handle(id));
             if self.sequencer.is_playing() {
@@ -775,12 +781,9 @@ impl MixerHandle<'_> {
             &self.mixer.state,
             id,
         )?;
-        self.mixer.runtime.sync_track_routing(
-            self.context,
-            self.commands,
-            &self.mixer.state,
-            id,
-        )?;
+        self.mixer
+            .runtime
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
         settle_graph_mutation(self.commands);
         Ok(())
     }
@@ -833,12 +836,9 @@ impl MixerHandle<'_> {
         route: TrackRoute,
     ) -> Result<(), AudioEngineError> {
         self.mixer.state.set_track_route(id, route)?;
-        self.mixer.runtime.sync_track_routing(
-            self.context,
-            self.commands,
-            &self.mixer.state,
-            id,
-        )?;
+        self.mixer
+            .runtime
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
         settle_graph_mutation(self.commands);
         Ok(())
     }
@@ -849,24 +849,18 @@ impl MixerHandle<'_> {
         routing: TrackRouting,
     ) -> Result<(), AudioEngineError> {
         self.mixer.state.set_track_routing(id, routing)?;
-        self.mixer.runtime.sync_track_routing(
-            self.context,
-            self.commands,
-            &self.mixer.state,
-            id,
-        )?;
+        self.mixer
+            .runtime
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
         settle_graph_mutation(self.commands);
         Ok(())
     }
 
     pub fn add_track_send(&mut self, id: TrackId, send: BusSend) -> Result<(), AudioEngineError> {
         self.mixer.state.add_track_bus_send(id, send)?;
-        self.mixer.runtime.sync_track_routing(
-            self.context,
-            self.commands,
-            &self.mixer.state,
-            id,
-        )?;
+        self.mixer
+            .runtime
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
         settle_graph_mutation(self.commands);
         Ok(())
     }
@@ -878,12 +872,9 @@ impl MixerHandle<'_> {
         send: BusSend,
     ) -> Result<(), AudioEngineError> {
         self.mixer.state.set_track_bus_send(id, index, send)?;
-        self.mixer.runtime.sync_track_routing(
-            self.context,
-            self.commands,
-            &self.mixer.state,
-            id,
-        )?;
+        self.mixer
+            .runtime
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
         settle_graph_mutation(self.commands);
         Ok(())
     }
@@ -894,12 +885,9 @@ impl MixerHandle<'_> {
         index: usize,
     ) -> Result<BusSend, AudioEngineError> {
         let removed = self.mixer.state.remove_track_bus_send(id, index)?;
-        self.mixer.runtime.sync_track_routing(
-            self.context,
-            self.commands,
-            &self.mixer.state,
-            id,
-        )?;
+        self.mixer
+            .runtime
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
         settle_graph_mutation(self.commands);
         Ok(removed)
     }
@@ -919,6 +907,9 @@ impl MixerHandle<'_> {
         self.mixer
             .runtime
             .sync_bus_effects(self.context, self.commands, &self.mixer.state, id)?;
+        self.mixer
+            .runtime
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
         settle_graph_mutation(self.commands);
         Ok(())
     }
@@ -945,7 +936,7 @@ impl MixerHandle<'_> {
         self.mixer.state.set_bus_route(id, route)?;
         self.mixer
             .runtime
-            .sync_bus_routing(self.context, self.commands, &self.mixer.state, id)?;
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
         settle_graph_mutation(self.commands);
         Ok(())
     }
@@ -958,7 +949,7 @@ impl MixerHandle<'_> {
         self.mixer.state.set_bus_routing(id, routing)?;
         self.mixer
             .runtime
-            .sync_bus_routing(self.context, self.commands, &self.mixer.state, id)?;
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
         settle_graph_mutation(self.commands);
         Ok(())
     }
@@ -967,7 +958,7 @@ impl MixerHandle<'_> {
         self.mixer.state.add_bus_send(id, send)?;
         self.mixer
             .runtime
-            .sync_bus_routing(self.context, self.commands, &self.mixer.state, id)?;
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
         settle_graph_mutation(self.commands);
         Ok(())
     }
@@ -981,7 +972,7 @@ impl MixerHandle<'_> {
         self.mixer.state.set_bus_send(id, index, send)?;
         self.mixer
             .runtime
-            .sync_bus_routing(self.context, self.commands, &self.mixer.state, id)?;
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
         settle_graph_mutation(self.commands);
         Ok(())
     }
@@ -994,7 +985,7 @@ impl MixerHandle<'_> {
         let removed = self.mixer.state.remove_bus_send(id, index)?;
         self.mixer
             .runtime
-            .sync_bus_routing(self.context, self.commands, &self.mixer.state, id)?;
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
         settle_graph_mutation(self.commands);
         Ok(removed)
     }
@@ -1026,6 +1017,9 @@ impl MixerHandle<'_> {
         self.mixer
             .runtime
             .sync_master_effects(self.context, self.commands, &self.mixer.state)?;
+        self.mixer
+            .runtime
+            .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
         settle_graph_mutation(self.commands);
         Ok(())
     }
@@ -1050,6 +1044,11 @@ impl MixerHandle<'_> {
                     self.commands,
                     &self.mixer.state,
                 )?;
+                self.mixer.runtime.sync_all_routing(
+                    self.context,
+                    self.commands,
+                    &self.mixer.state,
+                )?;
             }
             strip_index if strip_index <= self.mixer.state.track_count() => {
                 let track_id = TrackId((strip_index - 1) as u16);
@@ -1059,11 +1058,10 @@ impl MixerHandle<'_> {
                     &self.mixer.state,
                     track_id,
                 )?;
-                self.mixer.runtime.sync_track_routing(
+                self.mixer.runtime.sync_all_routing(
                     self.context,
                     self.commands,
                     &self.mixer.state,
-                    track_id,
                 )?;
             }
             _ => {
@@ -1084,6 +1082,11 @@ impl MixerHandle<'_> {
                     self.commands,
                     &self.mixer.state,
                     bus_id,
+                )?;
+                self.mixer.runtime.sync_all_routing(
+                    self.context,
+                    self.commands,
+                    &self.mixer.state,
                 )?;
             }
         }

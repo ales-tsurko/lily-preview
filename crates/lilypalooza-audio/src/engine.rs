@@ -172,6 +172,10 @@ impl AudioEngine {
         self.mixer.controller(address)
     }
 
+    pub fn sync_processor_latencies(&mut self) -> Result<(), AudioEngineError> {
+        self.mixer().sync_processor_latencies()
+    }
+
     /// Returns the sequencer control handle.
     pub fn sequencer(&mut self) -> SequencerHandle<'_> {
         SequencerHandle::new(&self.sequencer, &mut self.commands)
