@@ -47,7 +47,6 @@ impl Lilypalooza {
         self.open_processor_browser_target = Some(target);
         self.open_instrument_browser_track =
             (target.slot_index == 0 && target.strip_index > 0).then(|| target.strip_index - 1);
-        self.instrument_browser_backend = super::super::mixer::ProcessorBrowserBackend::BuiltIn;
         self.instrument_browser_search.clear();
         iced::widget::operation::focus(self.instrument_browser_search_input_id.clone())
     }
@@ -1993,6 +1992,27 @@ mod tests {
 
         assert_eq!(app.open_processor_browser_target, Some(target));
         assert_eq!(app.open_instrument_browser_track, None);
+    }
+
+    #[test]
+    fn processor_browser_reopening_keeps_selected_backend_for_session() {
+        let mut app = test_app();
+        let target = EditorTarget {
+            strip_index: 0,
+            slot_index: 1,
+        };
+
+        let _ = app.handle_mixer_message(MixerMessage::ToggleProcessorBrowser(target));
+        let _ = app.handle_mixer_message(MixerMessage::SelectProcessorBrowserBackend(
+            crate::app::mixer::ProcessorBrowserBackend::Clap,
+        ));
+        let _ = app.handle_mixer_message(MixerMessage::CloseProcessorBrowser);
+        let _ = app.handle_mixer_message(MixerMessage::ToggleProcessorBrowser(target));
+
+        assert_eq!(
+            app.instrument_browser_backend,
+            crate::app::mixer::ProcessorBrowserBackend::Clap
+        );
     }
 
     #[test]

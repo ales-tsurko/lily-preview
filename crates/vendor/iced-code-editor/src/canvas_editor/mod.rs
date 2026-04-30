@@ -262,6 +262,8 @@ pub struct CodeEditor {
     pub(crate) font: iced::Font,
     /// IME pre-edit state (for CJK input)
     pub(crate) ime_preedit: Option<ImePreedit>,
+    /// Last plain character accepted from a key event.
+    pub(crate) last_key_character_input: Option<char>,
     /// Last mouse click timestamp for double-click detection.
     pub(crate) last_click_at: Cell<Option<Instant>>,
     /// Last mouse click position for double-click detection.
@@ -574,6 +576,7 @@ impl CodeEditor {
             modifiers: Cell::new(iced::keyboard::Modifiers::default()),
             font: iced::Font::with_name("JetBrains Mono"),
             ime_preedit: None,
+            last_key_character_input: None,
             last_click_at: Cell::new(None),
             last_click_position: RefCell::new(None),
             last_click_count: Cell::new(0),

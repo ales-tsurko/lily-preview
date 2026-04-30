@@ -1376,9 +1376,7 @@ impl CodeEditor {
                 })
             }
             mouse::Event::ButtonReleased(mouse::Button::Left) => {
-                // Only handle mouse release when cursor is within bounds
-                // This prevents capturing events meant for other widgets
-                if cursor.is_over(bounds) {
+                if cursor.is_over(bounds) || self.is_dragging {
                     Some(Action::publish(Message::MouseRelease).and_capture())
                 } else {
                     None

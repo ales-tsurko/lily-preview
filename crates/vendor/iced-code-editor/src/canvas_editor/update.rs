@@ -357,6 +357,7 @@ impl CodeEditor {
             return Task::none();
         }
 
+        self.last_key_character_input = Some(ch);
         self.ensure_grouping_started("Typing");
 
         if let Some((start, end)) = self.get_selection_range()
@@ -1475,12 +1476,23 @@ impl CodeEditor {
         self.end_grouping_if_active();
 
         let previous_cursor = self.cursor;
+        let previous_selection_start = self.selection_start;
         self.handle_mouse_click(point);
         let clicked_cursor = self.cursor;
         self.reset_cursor_blink();
-        // Clear selection on click
-        self.clear_selection();
-        self.is_dragging = false;
+        if self
+            .modifiers
+            .get()
+            .contains(iced::keyboard::Modifiers::SHIFT)
+        {
+            self.selection_start = Some(previous_selection_start.unwrap_or(previous_cursor));
+            self.selection_end = Some(clicked_cursor);
+            self.is_dragging = false;
+        } else {
+            self.selection_start = Some(clicked_cursor);
+            self.selection_end = Some(clicked_cursor);
+            self.is_dragging = true;
+        }
 
         // Show cursor when focused
         self.show_cursor = true;
@@ -1589,6 +1601,9 @@ impl CodeEditor {
     /// A `Task<Message>` (currently Task::none() as no scrolling is needed)
     fn handle_mouse_release_msg(&mut self) -> Task<Message> {
         self.is_dragging = false;
+        if self.selection_start == self.selection_end {
+            self.clear_selection();
+        }
         Task::none()
     }
 
@@ -1968,6 +1983,7 @@ impl CodeEditor {
     /// A `Task<Message>` (currently Task::none())
     fn handle_ime_opened_msg(&mut self) -> Task<Message> {
         self.ime_preedit = None;
+        self.last_key_character_input = None;
         self.overlay_cache.clear();
         Task::none()
     }
@@ -1992,6 +2008,7 @@ impl CodeEditor {
         if content.is_empty() {
             self.ime_preedit = None;
         } else {
+            self.last_key_character_input = None;
             self.ime_preedit = Some(ImePreedit {
                 content: content.to_string(),
                 selection: selection.clone(),
@@ -2014,6 +2031,7 @@ impl CodeEditor {
     ///
     /// A `Task<Message>` that scrolls to cursor after insertion
     fn handle_ime_commit_msg(&mut self, text: &str) -> Task<Message> {
+        let had_preedit = self.ime_preedit.is_some();
         self.ime_preedit = None;
 
         if text.is_empty() {
@@ -2021,6 +2039,18 @@ impl CodeEditor {
             return Task::none();
         }
 
+        if !had_preedit {
+            let mut chars = text.chars();
+            if let Some(ch) = chars.next()
+                && chars.next().is_none()
+                && self.last_key_character_input == Some(ch)
+            {
+                self.last_key_character_input = None;
+                self.overlay_cache.clear();
+                return Task::none();
+            }
+        }
+        self.last_key_character_input = None;
         self.ensure_grouping_started("Typing");
 
         self.paste_text(text);
@@ -2037,6 +2067,7 @@ impl CodeEditor {
     /// A `Task<Message>` (currently Task::none())
     fn handle_ime_closed_msg(&mut self) -> Task<Message> {
         self.ime_preedit = None;
+        self.last_key_character_input = None;
         self.overlay_cache.clear();
         Task::none()
     }
@@ -2889,6 +2920,20 @@ mod tests {
     }
 
     #[test]
+    fn test_ime_commit_does_not_duplicate_plain_space_key_input() {
+        let mut editor = CodeEditor::new("foo", "toml");
+        editor.request_focus();
+        editor.has_canvas_focus = true;
+        editor.focus_locked = false;
+        editor.cursor = (0, 3);
+
+        let _ = editor.update(&Message::CharacterInput(' '));
+        let _ = editor.update(&Message::ImeCommit(" ".to_string()));
+
+        assert_eq!(editor.buffer.line(0), "foo ");
+    }
+
+    #[test]
     fn test_undo_char_insert() {
         let mut editor = CodeEditor::new("hello", "py");
         // Ensure editor has focus for character input
@@ -3161,6 +3206,19 @@ mod tests {
     }
 
     #[test]
+    fn test_backspace_deletes_one_space_without_selection() {
+        let mut editor = CodeEditor::new("key  ", "toml");
+        editor.cursor = (0, 5);
+
+        let _ = editor.update(&Message::Backspace);
+
+        assert_eq!(editor.buffer.line(0), "key ");
+        assert_eq!(editor.cursor, (0, 4));
+        assert_eq!(editor.selection_start, None);
+        assert_eq!(editor.selection_end, None);
+    }
+
+    #[test]
     fn test_delete_multiline_selection() {
         let mut editor = CodeEditor::new("line1\nline2\nline3", "py");
         editor.selection_start = Some((0, 2));
@@ -3198,6 +3256,13 @@ mod tests {
         assert!(editor.show_cursor);
     }
 
+    fn point_for(editor: &CodeEditor, line: usize, column: usize) -> iced::Point {
+        iced::Point::new(
+            editor.gutter_width() + 5.0 + editor.char_width() * column as f32 + 1.0,
+            editor.line_height() * line as f32 + 1.0,
+        )
+    }
+
     #[test]
     fn mouse_click_with_center_cursor_scrolls_to_clicked_cursor() {
         let content = (0..40)
@@ -3213,6 +3278,7 @@ mod tests {
         let click_y = editor.line_height() * 4.0 + 1.0;
         let expected_scroll = editor.target_vertical_scroll_offset_for_line(4, click_col);
         let task = editor.update(&Message::MouseClick(iced::Point::new(click_x, click_y)));
+        let _ = editor.update(&Message::MouseRelease);
 
         assert_eq!(editor.cursor_position(), (4, click_col));
         assert_eq!(editor.selection_start, None);
@@ -3221,6 +3287,49 @@ mod tests {
         assert_eq!(editor.viewport_scroll(), 0.0);
         assert_eq!(expected_scroll, editor.line_height() * 4.0);
         assert_eq!(task.units(), 2);
+    }
+
+    #[test]
+    fn mouse_drag_selects_from_click_anchor() {
+        let mut editor = CodeEditor::new("abcdef", "txt");
+        let start = point_for(&editor, 0, 1);
+        let end = point_for(&editor, 0, 4);
+
+        let _ = editor.update(&Message::MouseClick(start));
+        let _ = editor.update(&Message::MouseDrag(end));
+
+        assert_eq!(editor.cursor_position(), (0, 4));
+        assert_eq!(editor.selection_start, Some((0, 1)));
+        assert_eq!(editor.selection_end, Some((0, 4)));
+    }
+
+    #[test]
+    fn mouse_release_after_plain_click_clears_collapsed_selection() {
+        let mut editor = CodeEditor::new("abcdef", "txt");
+        let point = point_for(&editor, 0, 2);
+
+        let _ = editor.update(&Message::MouseClick(point));
+        let _ = editor.update(&Message::MouseRelease);
+
+        assert_eq!(editor.cursor_position(), (0, 2));
+        assert_eq!(editor.selection_start, None);
+        assert_eq!(editor.selection_end, None);
+        assert!(!editor.is_dragging);
+    }
+
+    #[test]
+    fn shift_click_extends_selection_from_previous_cursor() {
+        let mut editor = CodeEditor::new("abcdef", "txt");
+        editor.cursor = (0, 1);
+        editor.modifiers.set(iced::keyboard::Modifiers::SHIFT);
+        let end = point_for(&editor, 0, 4);
+
+        let _ = editor.update(&Message::MouseClick(end));
+
+        assert_eq!(editor.cursor_position(), (0, 4));
+        assert_eq!(editor.selection_start, Some((0, 1)));
+        assert_eq!(editor.selection_end, Some((0, 4)));
+        assert!(!editor.is_dragging);
     }
 
     #[test]
@@ -3237,6 +3346,7 @@ mod tests {
         let click_y = editor.line_height() * 4.0 + 1.0;
 
         let _ = editor.update(&Message::MouseClick(iced::Point::new(click_x, click_y)));
+        let _ = editor.update(&Message::MouseRelease);
         let _ = editor.handle_vertical_scroll(editor.line_height() * 4.0, 800.0, 120.0);
 
         assert_eq!(editor.cursor_position(), (4, click_col));

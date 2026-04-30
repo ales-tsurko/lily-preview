@@ -3322,15 +3322,8 @@ fn processor_slot_controls_sized(
         .into()
 }
 
-fn processor_hover_label(label: &str, list_item: bool) -> String {
-    crate::track_names::ellipsize_middle(
-        label,
-        if list_item {
-            18
-        } else {
-            PROCESSOR_SLOT_LABEL_MAX_LEN
-        },
-    )
+fn processor_hover_label(label: &str, _list_item: bool) -> String {
+    crate::track_names::ellipsize_middle(label, PROCESSOR_SLOT_LABEL_MAX_LEN)
 }
 
 fn processor_slot_label_segment(
@@ -3363,6 +3356,7 @@ fn processor_slot_label_segment(
             .width(Fill)
             .height(Length::Fixed(PROCESSOR_SLOT_BUTTON_HEIGHT))
             .align_y(alignment::Vertical::Center)
+            .clip(true)
         ]
         .spacing(ui_style::SPACE_XS)
         .align_y(alignment::Vertical::Center),
@@ -5715,6 +5709,14 @@ mod tests {
     #[test]
     fn hovered_processor_label_is_truncated() {
         let label = super::processor_hover_label("Very Long Effect Processor Name", false);
+
+        assert!(label.chars().count() <= super::PROCESSOR_SLOT_LABEL_MAX_LEN);
+        assert_ne!(label, "Very Long Effect Processor Name");
+    }
+
+    #[test]
+    fn effect_rack_processor_label_is_truncated_to_split_slot_width() {
+        let label = super::processor_hover_label("Very Long Effect Processor Name", true);
 
         assert!(label.chars().count() <= super::PROCESSOR_SLOT_LABEL_MAX_LEN);
         assert_ne!(label, "Very Long Effect Processor Name");
