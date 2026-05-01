@@ -11,6 +11,7 @@ score preview, plugin hosting, and project persistence.
 ## Features
 
 - multi-tab LilyPond editor with tree-sitter highlighting
+- watched LilyPond sources with automatic recompilation on save/external change
 - score preview with point-and-click navigation back to source
 - MIDI playback with transport, piano roll and feature-full DAW-grade mixer
 - DAW-style processor slots for built-in, CLAP, and VST3 instruments/effects
