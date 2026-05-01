@@ -240,10 +240,17 @@ impl<App: EguiApp> EguiWindow<App> {
 
         let clipped_primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
         let physical = self.window_info.physical_size();
-        let screen_size = [physical.width, physical.height];
+        let Some(screen_size) = renderable_screen_size(physical.width, physical.height) else {
+            // SAFETY: the current thread owns the baseview OpenGL context for this callback.
+            unsafe {
+                context.make_not_current();
+            }
+            return;
+        };
         let [r, g, b, a] = clear_color();
         // SAFETY: the glow context is current for this window during this render call.
         unsafe {
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             self.gl.clear_color(r, g, b, a);
             self.gl.clear(glow::COLOR_BUFFER_BIT);
         }
@@ -263,6 +270,10 @@ impl<App: EguiApp> EguiWindow<App> {
 
 fn clear_color() -> [f32; 4] {
     [0.0, 0.0, 0.0, 0.0]
+}
+
+fn renderable_screen_size(width: u32, height: u32) -> Option<[u32; 2]> {
+    (width > 0 && height > 0).then_some([width, height])
 }
 
 fn initial_window_info(size: Size) -> WindowInfo {
@@ -482,5 +493,12 @@ mod tests {
         assert_eq!(info.logical_size(), super::Size::new(640.0, 514.0));
         assert_eq!(info.physical_size().width, 640);
         assert_eq!(info.physical_size().height, 514);
+    }
+
+    #[test]
+    fn zero_sized_parented_egui_view_is_not_renderable() {
+        assert_eq!(super::renderable_screen_size(0, 480), None);
+        assert_eq!(super::renderable_screen_size(640, 0), None);
+        assert_eq!(super::renderable_screen_size(640, 480), Some([640, 480]));
     }
 }
