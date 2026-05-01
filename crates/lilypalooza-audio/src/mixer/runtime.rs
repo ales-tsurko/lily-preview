@@ -1612,6 +1612,7 @@ impl TrackInstrumentRuntime {
 
     fn free(self) {
         let node = self.handle.node_id();
+        self.binding.prepare_destroy();
         knyst_commands().disconnect(Connection::clear_from_nodes(node));
         knyst_commands().disconnect(Connection::clear_to_nodes(node));
         knyst_commands().free_node(node);
@@ -1717,6 +1718,9 @@ fn disconnect_effect_chain(source: NodeId, effects: &[Option<EffectRuntime>]) {
 
 fn free_effect(effect: EffectRuntime) {
     let node = effect.node_id();
+    if let Some(binding) = effect.binding.as_ref() {
+        binding.prepare_destroy();
+    }
     knyst_commands().disconnect(Connection::clear_from_nodes(node));
     knyst_commands().disconnect(Connection::clear_to_nodes(node));
     knyst_commands().free_node(node);
@@ -2153,8 +2157,10 @@ fn track_needs_runtime(track: &Track) -> bool {
         || track.effect_count() > 0
 }
 
-fn track_prefers_combined_signal_path(track: &Track) -> bool {
-    track.effect_count() == 0 && track.routing.sends.is_empty()
+fn track_prefers_combined_signal_path(_track: &Track) -> bool {
+    // Keep a stable instrument node when the first effect/send is inserted during playback.
+    // Rebuilding the instrument graph here detaches audio from the editor-owned plugin instance.
+    false
 }
 
 fn db_to_amplitude(db: f32) -> f32 {
@@ -2165,7 +2171,7 @@ fn db_to_amplitude(db: f32) -> f32 {
     }
 }
 
-fn process_stereo_balance_meter_scalar(
+pub(super) fn process_stereo_balance_meter_scalar(
     left_in: &[Sample],
     right_in: &[Sample],
     left_out: &mut [Sample],
@@ -2187,7 +2193,7 @@ fn process_stereo_balance_meter_scalar(
     (peak_left, peak_right)
 }
 
-fn process_stereo_balance_meter_simd(
+pub(super) fn process_stereo_balance_meter_simd(
     left_in: &[Sample],
     right_in: &[Sample],
     left_out: &mut [Sample],
@@ -2532,7 +2538,7 @@ impl knyst::r#gen::Gen for TrackInstrumentStripNode {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
     use knyst::controller::KnystCommands;
     use knyst::inputs;
@@ -2540,7 +2546,6 @@ mod tests {
     use knyst::prelude::{
         BlockSize, GenState, InputBundle, Sample, bus, graph_output, handle, impl_gen,
     };
-    use wide::f32x4;
 
     use super::{
         InstrumentProcessorNode, InstrumentRuntimeHandle, MasterRuntime, MeterTap, MixerRuntime,
@@ -2560,6 +2565,8 @@ mod tests {
     use knyst::time::Beats;
 
     const TEST_LATENCY_EFFECT_ID: &str = "org.lilypalooza.test.latency-effect";
+    static TEST_INSTRUMENT_PREPARE_DESTROY_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static TEST_EFFECT_PREPARE_DESTROY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     fn schedule_test_note(harness: &mut OfflineHarness, handle: InstrumentRuntimeHandle) {
         let scheduled_at = harness
@@ -2782,6 +2789,10 @@ mod tests {
         fn latency_samples(&self) -> u32 {
             self.latency.load(Ordering::Relaxed)
         }
+
+        fn prepare_destroy(&self) {
+            TEST_EFFECT_PREPARE_DESTROY_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     struct TestLatencyEffectController {
@@ -2840,6 +2851,10 @@ mod tests {
                 slot.kind,
                 ProcessorKind::BuiltIn { ref processor_id } if processor_id == BUILTIN_SOUNDFONT_ID
             ))
+        }
+
+        fn prepare_destroy(&self) {
+            TEST_INSTRUMENT_PREPARE_DESTROY_COUNT.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -3120,8 +3135,8 @@ mod tests {
         let right_in = vec![0.7, -0.5, 0.3, -0.1, 0.0, 0.2, -0.4, 0.6, -0.8, 0.9, -0.2];
         let mut scalar_left = vec![0.0; frames];
         let mut scalar_right = vec![0.0; frames];
-        let mut repeated_left = vec![0.0; frames];
-        let mut repeated_right = vec![0.0; frames];
+        let mut simd_left = vec![0.0; frames];
+        let mut simd_right = vec![0.0; frames];
 
         let scalar = super::process_stereo_balance_meter_scalar(
             &left_in,
@@ -3132,134 +3147,24 @@ mod tests {
             0.25,
             frames,
         );
-        let repeated = super::process_stereo_balance_meter_scalar(
+        let simd = super::process_stereo_balance_meter_simd(
             &left_in,
             &right_in,
-            &mut repeated_left,
-            &mut repeated_right,
+            &mut simd_left,
+            &mut simd_right,
             0.75,
             0.25,
             frames,
         );
 
-        for (a, b) in scalar_left.iter().zip(repeated_left.iter()) {
+        for (a, b) in scalar_left.iter().zip(simd_left.iter()) {
             assert!((a - b).abs() < 1.0e-6);
         }
-        for (a, b) in scalar_right.iter().zip(repeated_right.iter()) {
+        for (a, b) in scalar_right.iter().zip(simd_right.iter()) {
             assert!((a - b).abs() < 1.0e-6);
         }
-        assert!((scalar.0 - repeated.0).abs() < 1.0e-6);
-        assert!((scalar.1 - repeated.1).abs() < 1.0e-6);
-    }
-
-    fn process_stereo_balance_meter_simd_test(
-        left_in: &[Sample],
-        right_in: &[Sample],
-        left_out: &mut [Sample],
-        right_out: &mut [Sample],
-        left_mul: f32,
-        right_mul: f32,
-        frames: usize,
-    ) -> (f32, f32) {
-        let simd_width = 4;
-        let left_mul4 = f32x4::splat(left_mul);
-        let right_mul4 = f32x4::splat(right_mul);
-        let mut peak_left4 = f32x4::splat(0.0);
-        let mut peak_right4 = f32x4::splat(0.0);
-
-        let simd_frames = frames / simd_width * simd_width;
-        for frame in (0..simd_frames).step_by(simd_width) {
-            let left = f32x4::from([
-                left_in[frame],
-                left_in[frame + 1],
-                left_in[frame + 2],
-                left_in[frame + 3],
-            ]) * left_mul4;
-            let right = f32x4::from([
-                right_in[frame],
-                right_in[frame + 1],
-                right_in[frame + 2],
-                right_in[frame + 3],
-            ]) * right_mul4;
-
-            let left_arr = left.to_array();
-            let right_arr = right.to_array();
-            left_out[frame..frame + simd_width].copy_from_slice(&left_arr);
-            right_out[frame..frame + simd_width].copy_from_slice(&right_arr);
-
-            peak_left4 = peak_left4.max(left.abs());
-            peak_right4 = peak_right4.max(right.abs());
-        }
-
-        let left_peak_arr = peak_left4.to_array();
-        let right_peak_arr = peak_right4.to_array();
-        let mut peak_left = left_peak_arr.into_iter().fold(0.0_f32, f32::max);
-        let mut peak_right = right_peak_arr.into_iter().fold(0.0_f32, f32::max);
-
-        if simd_frames < frames {
-            let (tail_left, tail_right) = super::process_stereo_balance_meter_scalar(
-                &left_in[simd_frames..frames],
-                &right_in[simd_frames..frames],
-                &mut left_out[simd_frames..frames],
-                &mut right_out[simd_frames..frames],
-                left_mul,
-                right_mul,
-                frames - simd_frames,
-            );
-            peak_left = peak_left.max(tail_left);
-            peak_right = peak_right.max(tail_right);
-        }
-
-        (peak_left, peak_right)
-    }
-
-    #[test]
-    #[ignore = "manual perf report"]
-    fn perf_report_strip_scalar_vs_simd_release_shape() {
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        const FRAMES: usize = 64;
-        const ITERS: usize = 200_000;
-
-        let left_in: Vec<f32> = (0..FRAMES)
-            .map(|frame| ((frame as f32 * 0.17).sin() * 0.5) - 0.2)
-            .collect();
-        let right_in: Vec<f32> = (0..FRAMES)
-            .map(|frame| ((frame as f32 * 0.11).cos() * 0.45) + 0.15)
-            .collect();
-        let mut left_out = vec![0.0; FRAMES];
-        let mut right_out = vec![0.0; FRAMES];
-
-        let scalar_started = Instant::now();
-        for _ in 0..ITERS {
-            black_box(super::process_stereo_balance_meter_scalar(
-                black_box(&left_in),
-                black_box(&right_in),
-                black_box(&mut left_out),
-                black_box(&mut right_out),
-                black_box(0.82),
-                black_box(0.67),
-                black_box(FRAMES),
-            ));
-        }
-        let scalar_elapsed = scalar_started.elapsed();
-
-        let simd_started = Instant::now();
-        for _ in 0..ITERS {
-            black_box(process_stereo_balance_meter_simd_test(
-                black_box(&left_in),
-                black_box(&right_in),
-                black_box(&mut left_out),
-                black_box(&mut right_out),
-                black_box(0.82),
-                black_box(0.67),
-                black_box(FRAMES),
-            ));
-        }
-        let simd_elapsed = simd_started.elapsed();
-
-        eprintln!("strip perf over {ITERS} iters: scalar={scalar_elapsed:?} simd={simd_elapsed:?}");
+        assert!((scalar.0 - simd.0).abs() < 1.0e-6);
+        assert!((scalar.1 - simd.1).abs() < 1.0e-6);
     }
 
     #[test]
@@ -3654,6 +3559,102 @@ mod tests {
             harness.output_has_signal(),
             "live-created track runtime stayed silent without explicit routing sync"
         );
+    }
+
+    #[test]
+    fn inserting_first_effect_keeps_track_instrument_runtime() {
+        let mut harness = OfflineHarness::new(44_100, 64);
+        let mut state = MixerState::new();
+        state.set_soundfont(test_soundfont_resource());
+        state
+            .track_mut(TrackId(0))
+            .expect("track 0 should exist")
+            .set_instrument_slot(soundfont_slot(40));
+        let context = harness.context().clone();
+        let settings = harness.settings();
+        let mut mixer = Mixer::new(&context, harness.commands(), &settings, state)
+            .expect("mixer should initialize");
+        let before = mixer.runtime.tracks[0]
+            .as_ref()
+            .and_then(|runtime| runtime.instrument.as_ref())
+            .map(|instrument| instrument.handle.node_id())
+            .expect("track instrument should exist");
+
+        mixer
+            .state
+            .track_mut(TrackId(0))
+            .expect("track 0 should exist")
+            .set_effects(vec![latency_effect_slot()]);
+        let graph_changed = mixer
+            .runtime
+            .sync_track_effects(&context, harness.commands(), &mixer.state, TrackId(0))
+            .expect("track effects should sync");
+        let after = mixer.runtime.tracks[0]
+            .as_ref()
+            .and_then(|runtime| runtime.instrument.as_ref())
+            .map(|instrument| instrument.handle.node_id())
+            .expect("track instrument should still exist");
+
+        assert!(!graph_changed);
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn replacing_track_instrument_prepares_binding_for_destroy_before_freeing_node() {
+        let mut harness = OfflineHarness::new(44_100, 64);
+        let mut state = MixerState::new();
+        state.set_soundfont(test_soundfont_resource());
+        state
+            .track_mut(TrackId(0))
+            .expect("track 0 should exist")
+            .set_instrument_slot(soundfont_slot(40));
+        let context = harness.context().clone();
+        let settings = harness.settings();
+        let mut mixer = Mixer::new(&context, harness.commands(), &settings, state)
+            .expect("mixer should initialize");
+
+        TEST_INSTRUMENT_PREPARE_DESTROY_COUNT.store(0, Ordering::Relaxed);
+        mixer
+            .state
+            .track_mut(TrackId(0))
+            .expect("track 0 should exist")
+            .set_instrument_slot(SlotState::default());
+        mixer
+            .runtime
+            .sync_track_instrument(&context, harness.commands(), &mixer.state, TrackId(0))
+            .expect("track instrument should sync");
+
+        assert_eq!(
+            TEST_INSTRUMENT_PREPARE_DESTROY_COUNT.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn removing_track_effect_prepares_binding_for_destroy_before_freeing_node() {
+        let mut harness = OfflineHarness::new(44_100, 64);
+        let mut state = MixerState::new();
+        state
+            .track_mut(TrackId(0))
+            .expect("track 0 should exist")
+            .set_effects(vec![latency_effect_slot()]);
+        let context = harness.context().clone();
+        let settings = harness.settings();
+        let mut mixer = Mixer::new(&context, harness.commands(), &settings, state)
+            .expect("mixer should initialize");
+
+        TEST_EFFECT_PREPARE_DESTROY_COUNT.store(0, Ordering::Relaxed);
+        mixer
+            .state
+            .track_mut(TrackId(0))
+            .expect("track 0 should exist")
+            .set_effects(Vec::new());
+        mixer
+            .runtime
+            .sync_track_effects(&context, harness.commands(), &mixer.state, TrackId(0))
+            .expect("track effects should sync");
+
+        assert_eq!(TEST_EFFECT_PREPARE_DESTROY_COUNT.load(Ordering::Relaxed), 1);
     }
 
     #[test]

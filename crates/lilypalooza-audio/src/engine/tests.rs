@@ -2,7 +2,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use knyst::controller::KnystCommands;
 use knyst::graph::SimultaneousChanges;
@@ -218,14 +218,6 @@ fn create_test_mute_runtime(
     }))
 }
 
-fn benchmark_blocks(backend: &SharedTestBackendHandle, blocks: usize) -> Duration {
-    let started = Instant::now();
-    for _ in 0..blocks {
-        backend.process_block();
-    }
-    started.elapsed()
-}
-
 fn render_soundfont_program(program: u8) -> Vec<Sample> {
     let (backend, backend_handle) = SharedTestBackend::new(44_100, 64, 2);
     let mut engine = AudioEngine::start(MixerState::new(), backend, AudioEngineOptions::default())
@@ -373,70 +365,6 @@ fn bypassed_track_gain_effect_still_exposes_controller() {
         .expect("gain controller should exist");
 
     assert_eq!(controller.descriptor().name, "Gain");
-}
-
-#[test]
-#[ignore = "manual perf report"]
-fn perf_report_engine_block_costs() {
-    const BLOCKS: usize = 20_000;
-
-    let (empty_backend, empty_handle) = SharedTestBackend::new(44_100, 64, 2);
-    let _empty_engine = AudioEngine::start(
-        MixerState::new(),
-        empty_backend,
-        AudioEngineOptions::default(),
-    )
-    .expect("empty engine should start");
-    settle_backend(&empty_handle);
-    let empty_idle = benchmark_blocks(&empty_handle, BLOCKS);
-
-    let (armed_backend, armed_handle) = SharedTestBackend::new(44_100, 64, 2);
-    let mut armed_engine = AudioEngine::start(
-        MixerState::new(),
-        armed_backend,
-        AudioEngineOptions::default(),
-    )
-    .expect("armed engine should start");
-    {
-        let mut mixer = armed_engine.mixer();
-        mixer
-            .set_soundfont(test_soundfont_resource())
-            .expect("soundfont should load");
-        mixer
-            .set_track_instrument(TrackId(0), soundfont_slot(0))
-            .expect("track should accept soundfont");
-    }
-    settle_backend(&armed_handle);
-    let armed_idle = benchmark_blocks(&armed_handle, BLOCKS);
-
-    let (play_backend, play_handle) = SharedTestBackend::new(44_100, 64, 2);
-    let mut play_engine = AudioEngine::start(
-        MixerState::new(),
-        play_backend,
-        AudioEngineOptions::default(),
-    )
-    .expect("playback engine should start");
-    play_engine
-        .replace_score_from_midi_bytes(&simple_midi_bytes(480))
-        .expect("midi should load");
-    {
-        let mut mixer = play_engine.mixer();
-        mixer
-            .set_soundfont(test_soundfont_resource())
-            .expect("soundfont should load");
-        mixer
-            .set_track_instrument(TrackId(0), soundfont_slot(0))
-            .expect("track should accept soundfont");
-    }
-    settle_backend(&play_handle);
-    play_engine.transport().play();
-    settle_backend(&play_handle);
-    let playback = benchmark_blocks(&play_handle, BLOCKS);
-
-    eprintln!(
-        "engine perf over {BLOCKS} blocks: empty_idle={:?} armed_idle={:?} playback={:?}",
-        empty_idle, armed_idle, playback
-    );
 }
 
 #[impl_gen]
@@ -835,7 +763,6 @@ fn selecting_soundfont_program_before_playback_produces_master_output() {
     let (backend, backend_handle) = SharedTestBackend::new(44_100, 64, 2);
     let mut engine = AudioEngine::start(MixerState::new(), backend, AudioEngineOptions::default())
         .expect("engine should start");
-    let _audio = backend_handle.start_realtime();
 
     engine
         .sequencer()
@@ -1434,7 +1361,6 @@ fn engine_renders_audio_without_callback_installation() {
     let (backend, backend_handle) = SharedTestBackend::new(44_100, 64, 2);
     let mut engine = AudioEngine::start(MixerState::new(), backend, AudioEngineOptions::default())
         .expect("engine should start");
-    let _audio = backend_handle.start_realtime();
 
     {
         let mut mixer = engine.mixer();

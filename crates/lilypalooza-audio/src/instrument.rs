@@ -160,6 +160,9 @@ pub trait RuntimeBinding: Send {
     fn update_in_place(&self, _slot: &SlotState) -> Result<bool, ProcessorStateError> {
         Ok(false)
     }
+
+    /// Prepares the backend for destruction before its audio node is freed.
+    fn prepare_destroy(&self) {}
 }
 
 /// Instrument runtime instance created by a processor factory.
@@ -224,8 +227,8 @@ pub trait EditorSession {
     fn detach(&mut self) -> Result<(), EditorError>;
     /// Updates editor visibility.
     fn set_visible(&mut self, visible: bool) -> Result<(), EditorError>;
-    /// Resizes the editor content area.
-    fn resize(&mut self, size: EditorSize) -> Result<(), EditorError>;
+    /// Resizes the editor content area and returns the accepted content size.
+    fn resize(&mut self, size: EditorSize) -> Result<EditorSize, EditorError>;
 }
 
 /// Static processor description.

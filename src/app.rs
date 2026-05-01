@@ -26,8 +26,8 @@ use crate::state::{self, GlobalState, ProjectState};
 use crate::ui_style;
 
 use messages::{
-    EditorMessage, FileMessage, KeyPress, LoggerMessage, Message, PaneMessage, PianoRollMessage,
-    PromptMessage, ViewerMessage,
+    EditorMessage, FileMessage, KeyPress, LoggerMessage, Message, MixerMessage, PaneMessage,
+    PianoRollMessage, PromptMessage, ViewerMessage,
 };
 use piano_roll::PianoRollState;
 use processor_editor_windows::EditorWindowManager;
@@ -76,6 +76,9 @@ const EDITOR_FRAME_TITLE_ROW_HEIGHT: f32 = 32.0;
 const EDITOR_FRAME_PRESET_ROW_HEIGHT: f32 = 24.0;
 const EDITOR_FRAME_PRESET_BROWSER_HEIGHT: f32 = 116.0;
 const EDITOR_FRAME_ICON_SIZE: f32 = 13.0;
+const EDITOR_FRAME_RESIZE_GRIP_SIZE: f32 = 18.0;
+const EDITOR_FRAME_MIN_CONTENT_WIDTH: f64 = 160.0;
+const EDITOR_FRAME_MIN_CONTENT_HEIGHT: f64 = 120.0;
 const EGUI_ICON_CHEVRON_LEFT: &[u8] = include_bytes!("../assets/icons/chevron-left.svg");
 const EGUI_ICON_CHEVRON_RIGHT: &[u8] = include_bytes!("../assets/icons/chevron-right.svg");
 const EGUI_ICON_CHEVRON_DOWN: &[u8] = include_bytes!("../assets/icons/chevron-down.svg");
@@ -245,7 +248,7 @@ impl editor_host::EditorFrame for AppEditorFrame {
         ui: &mut editor_host::egui::Ui,
         state: &editor_host::EditorHostState,
     ) -> editor_host::EditorFrameAction {
-        let rect = ui.max_rect();
+        let rect = self.frame_rect(ui.max_rect(), state);
         ui.painter().rect_filled(rect, 0.0, self.style.frame_color);
         ui.painter().rect_stroke(
             rect.shrink(self.border_width / 2.0),
@@ -311,11 +314,14 @@ impl editor_host::EditorFrame for AppEditorFrame {
         );
 
         let preset_command = self.render_preset_strip(ui, state, titlebar);
+        let resize_command = self.render_resize_grip(ui, rect, state);
 
         if close.clicked() {
             editor_host::EditorFrameAction::Close
         } else if drag.drag_started_by(editor_host::egui::PointerButton::Primary) {
             editor_host::EditorFrameAction::DragWindow
+        } else if let Some(command) = resize_command {
+            editor_host::EditorFrameAction::Command(command)
         } else if let Some(command) = preset_command {
             editor_host::EditorFrameAction::Command(command)
         } else {
@@ -325,6 +331,91 @@ impl editor_host::EditorFrame for AppEditorFrame {
 }
 
 impl AppEditorFrame {
+    fn render_resize_grip(
+        &self,
+        ui: &mut editor_host::egui::Ui,
+        rect: editor_host::egui::Rect,
+        state: &editor_host::EditorHostState,
+    ) -> Option<editor_host::EditorFrameCommand> {
+        if !state.resizable {
+            return None;
+        }
+
+        let grip_rect = self.resize_grip_rect(rect);
+        let response = ui.allocate_rect(grip_rect, editor_host::egui::Sense::drag());
+        let tint = if response.hovered() || response.dragged() {
+            self.style.title_color
+        } else {
+            self.style.muted_text
+        };
+        let painter = ui.painter();
+        let stroke = editor_host::egui::Stroke::new(1.0, tint);
+        for offset in [5.0, 9.0, 13.0] {
+            painter.line_segment(
+                [
+                    grip_rect.right_bottom() - editor_host::egui::vec2(offset, 2.0),
+                    grip_rect.right_bottom() - editor_host::egui::vec2(2.0, offset),
+                ],
+                stroke,
+            );
+        }
+
+        response.dragged().then(|| {
+            let delta = ui.input(|input| input.pointer.delta());
+            self.resize_command_for_drag(state.content_size, delta)
+        })
+    }
+
+    fn resize_grip_rect(&self, rect: editor_host::egui::Rect) -> editor_host::egui::Rect {
+        editor_host::egui::Rect::from_min_max(
+            rect.right_bottom()
+                - editor_host::egui::vec2(
+                    EDITOR_FRAME_RESIZE_GRIP_SIZE,
+                    EDITOR_FRAME_RESIZE_GRIP_SIZE,
+                ),
+            rect.right_bottom(),
+        )
+    }
+
+    fn resize_command_for_drag(
+        &self,
+        content_size: editor_host::Size,
+        delta: editor_host::egui::Vec2,
+    ) -> editor_host::EditorFrameCommand {
+        let rel_x = f64::from(delta.x) / content_size.width.max(1.0);
+        let rel_y = f64::from(delta.y) / content_size.height.max(1.0);
+        let rel = if rel_x.abs() >= rel_y.abs() {
+            rel_x
+        } else {
+            rel_y
+        };
+        let scale = (1.0 + rel).max(
+            (EDITOR_FRAME_MIN_CONTENT_WIDTH / content_size.width.max(1.0))
+                .max(EDITOR_FRAME_MIN_CONTENT_HEIGHT / content_size.height.max(1.0)),
+        );
+        editor_host::EditorFrameCommand::ResizeContent {
+            width: (content_size.width * scale).round().max(1.0) as u32,
+            height: (content_size.height * scale).round().max(1.0) as u32,
+        }
+    }
+
+    fn frame_rect(
+        &self,
+        available: editor_host::egui::Rect,
+        state: &editor_host::EditorHostState,
+    ) -> editor_host::egui::Rect {
+        let layout = editor_host::host_layout(
+            state.content_size.width,
+            state.content_size.height,
+            Self::chrome_height(state),
+            self.frame_thickness,
+        );
+        editor_host::egui::Rect::from_min_size(
+            available.left_top(),
+            editor_host::egui::vec2(layout.outer_width as f32, layout.outer_height as f32),
+        )
+    }
+
     fn preset_menu_icon(expanded: bool) -> AppEditorFrameIcon {
         if expanded {
             AppEditorFrameIcon::ChevronDown
@@ -1023,6 +1114,8 @@ struct Lilypalooza {
     mixer_undo_stack: Vec<MixerState>,
     mixer_redo_stack: Vec<MixerState>,
     pending_mixer_undo_snapshot: Option<MixerState>,
+    pending_mixer_message_after_editor_close: Option<(window::Id, MixerMessage)>,
+    pending_mixer_message_after_editor_detach: Option<MixerMessage>,
     build_dir: Option<TempDir>,
     compile_requested: bool,
     compile_outputs_loading: bool,
@@ -1610,6 +1703,8 @@ fn new_with_loaded_state(
         mixer_undo_stack: Vec::new(),
         mixer_redo_stack: Vec::new(),
         pending_mixer_undo_snapshot: None,
+        pending_mixer_message_after_editor_close: None,
+        pending_mixer_message_after_editor_detach: None,
         build_dir: None,
         compile_requested: false,
         compile_outputs_loading: false,
@@ -1859,6 +1954,9 @@ fn subscription(app: &Lilypalooza) -> Subscription<Message> {
     }
 
     if app.processor_editor_windows.has_installed_hosts() {
+        subscriptions.push(iced::time::every(EDITOR_HOST_POLL_INTERVAL).map(Message::Frame));
+    }
+    if app.pending_mixer_message_after_editor_detach.is_some() {
         subscriptions.push(iced::time::every(EDITOR_HOST_POLL_INTERVAL).map(Message::Frame));
     }
 
@@ -2408,6 +2506,71 @@ mod tests {
         let frame = AppEditorFrame::from_theme(&iced::Theme::Dark);
 
         assert_eq!(frame.titlebar_height, EDITOR_FRAME_COMPACT_CHROME_HEIGHT);
+    }
+
+    #[test]
+    fn app_editor_frame_rect_uses_accepted_content_size_not_live_window_size() {
+        let frame = AppEditorFrame::from_theme(&iced::Theme::Dark);
+        let state = editor_host::EditorHostState {
+            title: "Editor".to_string(),
+            resizable: true,
+            close_requested: false,
+            content_size: editor_host::Size {
+                width: 640.0,
+                height: 480.0,
+            },
+            preset: None,
+        };
+        let live_rect = editor_host::egui::Rect::from_min_size(
+            editor_host::egui::pos2(0.0, 0.0),
+            editor_host::egui::vec2(900.0, 700.0),
+        );
+
+        let rect = frame.frame_rect(live_rect, &state);
+
+        assert_eq!(rect.width(), 640.0 + (EDITOR_FRAME_THICKNESS * 2.0) as f32);
+        assert_eq!(
+            rect.height(),
+            480.0
+                + EDITOR_FRAME_COMPACT_CHROME_HEIGHT as f32
+                + (EDITOR_FRAME_THICKNESS * 2.0) as f32
+        );
+        assert!(rect.width() < live_rect.width());
+        assert!(rect.height() < live_rect.height());
+    }
+
+    #[test]
+    fn app_editor_frame_resize_grip_stays_at_bottom_right() {
+        let frame = AppEditorFrame::from_theme(&iced::Theme::Dark);
+        let rect = editor_host::egui::Rect::from_min_size(
+            editor_host::egui::pos2(0.0, 0.0),
+            editor_host::egui::vec2(640.0, 480.0),
+        );
+
+        let grip = frame.resize_grip_rect(rect);
+
+        assert_eq!(grip.right(), rect.right());
+        assert_eq!(grip.bottom(), rect.bottom());
+    }
+
+    #[test]
+    fn app_editor_frame_resize_command_preserves_content_aspect() {
+        let frame = AppEditorFrame::from_theme(&iced::Theme::Dark);
+        let command = frame.resize_command_for_drag(
+            editor_host::Size {
+                width: 640.0,
+                height: 480.0,
+            },
+            editor_host::egui::vec2(120.0, 40.0),
+        );
+
+        assert_eq!(
+            command,
+            editor_host::EditorFrameCommand::ResizeContent {
+                width: 760,
+                height: 570,
+            }
+        );
     }
 
     #[test]

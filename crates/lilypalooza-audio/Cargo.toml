@@ -19,4 +19,14 @@ wide = "1.3.0"
 thiserror = "2.0.18"
 
 [dev-dependencies]
+knyst = { git = "https://github.com/ales-tsurko/knyst", rev = "be8df5331539c922ab362b57621563186e789c89", default-features = false, features = ["cpal"] }
+midly = "0.5.3"
 ron = "0.8.1"
+
+[[bench]]
+name = "engine_block_costs"
+harness = false
+
+[[bench]]
+name = "strip_balance_meter"
+harness = false

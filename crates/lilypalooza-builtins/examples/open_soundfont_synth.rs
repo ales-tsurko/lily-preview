@@ -407,7 +407,16 @@ impl EditorFrame for DebugEditorFrame {
         ui: &mut editor_host::egui::Ui,
         state: &EditorHostState,
     ) -> EditorFrameAction {
-        let rect = ui.max_rect();
+        let layout = host_layout(
+            state.content_size.width,
+            state.content_size.height,
+            self.titlebar_height,
+            self.frame_thickness,
+        );
+        let rect = editor_host::egui::Rect::from_min_size(
+            ui.max_rect().left_top(),
+            editor_host::egui::vec2(layout.outer_width as f32, layout.outer_height as f32),
+        );
         ui.painter().rect_filled(rect, 0.0, self.style.frame_color);
         ui.painter().rect_stroke(
             rect.shrink(DEBUG_EDITOR_FRAME_BORDER_INSET),

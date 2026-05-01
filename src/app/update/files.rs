@@ -252,7 +252,11 @@ impl Lilypalooza {
         Task::batch(tasks)
     }
 
-    pub(in crate::app) fn handle_frame(&mut self) -> Task<Message> {
+    pub(in crate::app) fn handle_frame(&mut self, _now: std::time::Instant) -> Task<Message> {
+        if let Some(message) = self.pending_mixer_message_after_editor_detach.take() {
+            return self.handle_mixer_message(message);
+        }
+
         if self.playback.is_some() {
             self.refresh_playback_position();
         }

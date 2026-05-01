@@ -151,11 +151,12 @@ pub struct Size {
     pub height: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EditorHostState {
     pub title: String,
     pub resizable: bool,
     pub close_requested: bool,
+    pub content_size: Size,
     pub preset: Option<EditorPresetState>,
 }
 
@@ -198,6 +199,7 @@ pub enum EditorFrameCommand {
     DeletePreset(String),
     SavePreset,
     TogglePresetBrowser,
+    ResizeContent { width: u32, height: u32 },
 }
 
 pub trait EditorFrame {
@@ -214,6 +216,7 @@ pub struct InstalledHost {
     preset_state: Arc<Mutex<Option<EditorPresetState>>>,
     frame_commands: Arc<Mutex<Vec<EditorFrameCommand>>>,
     frame_window: Option<EguiWindowHandle>,
+    frame_content_size: Arc<Mutex<Size>>,
     content_size: Size,
     frame_thickness: f64,
 }
@@ -274,7 +277,10 @@ impl InstalledHost {
     }
 
     pub fn resize_content(&mut self, content_size: Size) -> Result<(), Error> {
-        self.content_size = content_size;
+        self.set_content_size(content_size);
+        if self.frame_window.is_none() {
+            return Ok(());
+        }
         resize_installed_host(
             &self.host,
             &self.content,
@@ -285,11 +291,23 @@ impl InstalledHost {
         )
     }
 
+    fn set_content_size(&mut self, content_size: Size) {
+        self.content_size = content_size;
+        if let Ok(mut frame_content_size) = self.frame_content_size.lock() {
+            *frame_content_size = content_size;
+        }
+    }
+
     pub fn resize_outer(&mut self, outer_size: Size) -> Result<Size, Error> {
         let content_size =
             content_size_from_outer_size(outer_size, self.titlebar_height(), self.frame_thickness);
         self.resize_content(content_size)?;
         Ok(content_size)
+    }
+
+    #[must_use]
+    pub fn content_size_from_outer_size(&self, outer_size: Size) -> Size {
+        content_size_from_outer_size(outer_size, self.titlebar_height(), self.frame_thickness)
     }
 
     fn titlebar_height(&self) -> f64 {
@@ -338,6 +356,10 @@ impl InstalledHost {
     ) -> (Self, Vec<EditorFrameCommand>) {
         let commands = commands.into_iter().collect::<Vec<_>>();
         let frame_commands = Arc::new(Mutex::new(commands.clone()));
+        let content_size = Size {
+            width: 440.0,
+            height: 360.0,
+        };
         let host = WindowSnapshot {
             window: WindowHandleSnapshot::AppKit { ns_view: 1 },
             display: Some(DisplayHandleSnapshot::AppKit),
@@ -351,10 +373,8 @@ impl InstalledHost {
                 preset_state: Arc::new(Mutex::new(None)),
                 frame_commands,
                 frame_window: None,
-                content_size: Size {
-                    width: 440.0,
-                    height: 360.0,
-                },
+                frame_content_size: Arc::new(Mutex::new(content_size)),
+                content_size,
                 frame_thickness: 4.0,
             },
             commands,
@@ -576,6 +596,7 @@ fn non_zero_u32(value: u32, name: &str) -> Result<NonZeroU32, Error> {
 pub(crate) fn open_egui_frame(
     parent: WindowSnapshot,
     options: &EditorHostOptions,
+    content_size: Size,
     outer_width: f64,
     outer_height: f64,
     frame: impl EditorFrame + Send + 'static,
@@ -583,16 +604,19 @@ pub(crate) fn open_egui_frame(
     let close_requested = Arc::new(AtomicBool::new(false));
     let title = Arc::new(Mutex::new(options.title.clone()));
     let preset_state = Arc::new(Mutex::new(None));
+    let frame_content_size = Arc::new(Mutex::new(content_size));
     let frame_commands = Arc::new(Mutex::new(Vec::new()));
     let app = FrameApp {
         frame,
         host: parent,
         title: Arc::clone(&title),
         preset_state: Arc::clone(&preset_state),
+        content_size: Arc::clone(&frame_content_size),
         state: EditorHostState {
             title: options.title.clone(),
             resizable: options.resizable,
             close_requested: false,
+            content_size,
             preset: None,
         },
         close_requested: Arc::clone(&close_requested),
@@ -613,6 +637,7 @@ pub(crate) fn open_egui_frame(
         close_requested,
         title,
         preset_state,
+        content_size: frame_content_size,
         frame_commands,
     })
 }
@@ -622,6 +647,7 @@ pub(crate) struct EguiFrameHost {
     pub(crate) close_requested: Arc<AtomicBool>,
     pub(crate) title: Arc<Mutex<String>>,
     pub(crate) preset_state: Arc<Mutex<Option<EditorPresetState>>>,
+    pub(crate) content_size: Arc<Mutex<Size>>,
     pub(crate) frame_commands: Arc<Mutex<Vec<EditorFrameCommand>>>,
 }
 
@@ -630,6 +656,7 @@ struct FrameApp<F> {
     host: WindowSnapshot,
     title: Arc<Mutex<String>>,
     preset_state: Arc<Mutex<Option<EditorPresetState>>>,
+    content_size: Arc<Mutex<Size>>,
     state: EditorHostState,
     close_requested: Arc<AtomicBool>,
     frame_commands: Arc<Mutex<Vec<EditorFrameCommand>>>,
@@ -643,6 +670,9 @@ impl<F: EditorFrame> EguiApp for FrameApp<F> {
         }
         if let Ok(preset_state) = self.preset_state.lock() {
             self.state.preset.clone_from(&preset_state);
+        }
+        if let Ok(content_size) = self.content_size.lock() {
+            self.state.content_size = *content_size;
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -851,6 +881,44 @@ mod tests {
         host.set_preset_state(Some(state.clone()));
 
         assert_eq!(host.preset_state(), Some(state));
+    }
+
+    #[test]
+    fn installed_host_derives_content_size_from_current_chrome() {
+        let (host, _) = super::InstalledHost::test_with_frame_commands([]);
+
+        assert_eq!(
+            host.content_size_from_outer_size(Size {
+                width: 648.0,
+                height: 522.0,
+            }),
+            Size {
+                width: 640.0,
+                height: 480.0,
+            }
+        );
+    }
+
+    #[test]
+    fn installed_host_updates_frame_content_size_when_content_resizes() {
+        let (mut host, _) = super::InstalledHost::test_with_frame_commands([]);
+
+        host.resize_content(Size {
+            width: 512.0,
+            height: 384.0,
+        })
+        .expect("test host without native window should still update state");
+
+        assert_eq!(
+            *host
+                .frame_content_size
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Size {
+                width: 512.0,
+                height: 384.0,
+            }
+        );
     }
 
     #[test]

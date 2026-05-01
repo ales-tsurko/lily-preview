@@ -485,13 +485,13 @@ impl EditorSession for SoundfontEditorSession {
         Ok(())
     }
 
-    fn resize(&mut self, size: EditorSize) -> Result<(), EditorError> {
+    fn resize(&mut self, size: EditorSize) -> Result<EditorSize, EditorError> {
         if size.width == 0 || size.height == 0 {
             return Err(EditorError::HostUnavailable(
                 "SoundFont editor size must be non-zero".to_string(),
             ));
         }
-        Ok(())
+        Ok(size)
     }
 }
 

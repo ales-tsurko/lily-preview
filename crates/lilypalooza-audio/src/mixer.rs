@@ -21,6 +21,38 @@ pub use track::{
     BusId, BusSend, INSTRUMENT_TRACK_COUNT, Track, TrackId, TrackRoute, TrackRouting, TrackState,
 };
 
+/// Runs the scalar strip balance/meter processing path for manual benchmarks.
+#[doc(hidden)]
+pub fn benchmark_process_stereo_balance_meter_scalar(
+    left_in: &[f32],
+    right_in: &[f32],
+    left_out: &mut [f32],
+    right_out: &mut [f32],
+    left_mul: f32,
+    right_mul: f32,
+    frames: usize,
+) -> (f32, f32) {
+    runtime::process_stereo_balance_meter_scalar(
+        left_in, right_in, left_out, right_out, left_mul, right_mul, frames,
+    )
+}
+
+/// Runs the SIMD strip balance/meter processing path for manual benchmarks.
+#[doc(hidden)]
+pub fn benchmark_process_stereo_balance_meter_simd(
+    left_in: &[f32],
+    right_in: &[f32],
+    left_out: &mut [f32],
+    right_out: &mut [f32],
+    left_mul: f32,
+    right_mul: f32,
+    frames: usize,
+) -> (f32, f32) {
+    runtime::process_stereo_balance_meter_simd(
+        left_in, right_in, left_out, right_out, left_mul, right_mul, frames,
+    )
+}
+
 const GRAPH_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const PLAYHEAD_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 

@@ -86,7 +86,7 @@ pub(super) fn update(app: &mut Lilypalooza, message: Message) -> Task<Message> {
         Message::ModifiersChanged(modifiers) => app.handle_modifiers_changed(modifiers),
         Message::PrimaryMousePressed(pressed) => app.handle_primary_mouse_pressed(pressed),
         Message::Tick => app.handle_tick(),
-        Message::Frame(_now) => app.handle_frame(),
+        Message::Frame(now) => app.handle_frame(now),
         Message::WindowResized { window_id, size } => app.handle_window_resized(window_id, size),
         Message::WindowCloseRequested(window_id) => app.handle_window_close_requested(window_id),
     }

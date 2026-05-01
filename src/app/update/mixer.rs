@@ -20,7 +20,7 @@ fn processor_editor_window_settings(
         min_size: descriptor
             .min_size
             .map(|size| Size::new(size.width as f32, size.height as f32)),
-        resizable: descriptor.resizable,
+        resizable: false,
         closeable: true,
         minimizable: false,
         decorations: false,
@@ -66,6 +66,27 @@ impl Lilypalooza {
             self.log_processor_editor_error("detach", error);
         }
         window::close(window_id)
+    }
+
+    fn close_editor_before_deferred_mixer_message(
+        &mut self,
+        target: EditorTarget,
+        message: MixerMessage,
+    ) -> Option<Task<Message>> {
+        let window_id = self.processor_editor_windows.window_for_target(target)?;
+        if !self.processor_editor_windows.pending_contains(window_id)
+            && !self.processor_editor_windows.window_visible(window_id)
+            && let Some((window_id, mut session)) =
+                self.processor_editor_windows.remove_target(target)
+        {
+            if let Err(error) = session.detach() {
+                self.log_processor_editor_error("detach", error);
+            }
+            self.pending_mixer_message_after_editor_detach = Some(message);
+            return Some(window::close(window_id));
+        }
+        self.pending_mixer_message_after_editor_close = Some((window_id, message));
+        Some(window::close(window_id))
     }
 
     fn destroy_editor_strip_and_shift_later(&mut self, strip_index: usize) -> Task<Message> {
@@ -208,10 +229,20 @@ impl Lilypalooza {
     }
 
     pub(in crate::app) fn handle_window_closed(&mut self, window_id: window::Id) -> Task<Message> {
+        let deferred = match self.pending_mixer_message_after_editor_close.take() {
+            Some((pending_window_id, message)) if pending_window_id == window_id => Some(message),
+            other => {
+                self.pending_mixer_message_after_editor_close = other;
+                None
+            }
+        };
         if let Some((_target, mut session)) = self.processor_editor_windows.remove_window(window_id)
             && let Err(error) = session.detach()
         {
             self.log_processor_editor_error("detach", error);
+        }
+        if let Some(message) = deferred {
+            self.pending_mixer_message_after_editor_detach = Some(message);
         }
         Task::none()
     }
@@ -573,6 +604,13 @@ impl Lilypalooza {
             MixerMessage::SelectTrackInstrument(_, _) | MixerMessage::SelectProcessor(_, _)
         ) {
             self.close_processor_browser();
+        }
+
+        if let Some(target) = editor_target_destroyed_by_mixer_message(&message)
+            && let Some(task) =
+                self.close_editor_before_deferred_mixer_message(target, message.clone())
+        {
+            return task;
         }
 
         let editor_cleanup = match &message {
@@ -957,6 +995,17 @@ impl Lilypalooza {
     }
 }
 
+fn editor_target_destroyed_by_mixer_message(message: &MixerMessage) -> Option<EditorTarget> {
+    match message {
+        MixerMessage::SelectTrackInstrument(index, _) => Some(EditorTarget {
+            strip_index: index + 1,
+            slot_index: 0,
+        }),
+        MixerMessage::SelectProcessor(target, _) => Some(*target),
+        _ => None,
+    }
+}
+
 impl Lilypalooza {
     fn commit_pending_mixer_history(&mut self) {
         if let Some(snapshot) = self.pending_mixer_undo_snapshot.take() {
@@ -1304,6 +1353,17 @@ impl Lilypalooza {
                     .and_then(|state| state.selected_id);
                 self.refresh_editor_preset_state(target, selected_id);
             }
+            EditorFrameCommand::ResizeContent { width, height } => {
+                for error in self.processor_editor_windows.resize_target_content(
+                    target,
+                    editor_host::Size {
+                        width: f64::from(width),
+                        height: f64::from(height),
+                    },
+                ) {
+                    self.log_processor_editor_error("resize", error);
+                }
+            }
         }
     }
 
@@ -1625,14 +1685,17 @@ mod tests {
             Ok(())
         }
 
-        fn resize(&mut self, _size: EditorSize) -> Result<(), EditorError> {
-            Ok(())
+        fn resize(&mut self, size: EditorSize) -> Result<EditorSize, EditorError> {
+            Ok(size)
         }
     }
 
     struct RecordingEditorSession {
         visible: Rc<RefCell<Vec<bool>>>,
         detached: Rc<RefCell<usize>>,
+    }
+    struct InitialSizeEditorSession {
+        calls: Rc<RefCell<usize>>,
     }
 
     impl EditorSession for RecordingEditorSession {
@@ -1650,14 +1713,57 @@ mod tests {
             Ok(())
         }
 
-        fn resize(&mut self, _size: EditorSize) -> Result<(), EditorError> {
+        fn resize(&mut self, size: EditorSize) -> Result<EditorSize, EditorError> {
+            Ok(size)
+        }
+    }
+
+    impl EditorSession for InitialSizeEditorSession {
+        fn initial_size(&mut self) -> Result<Option<EditorSize>, EditorError> {
+            *self.calls.borrow_mut() += 1;
+            Ok(Some(EditorSize {
+                width: 1200,
+                height: 600,
+            }))
+        }
+
+        fn attach(&mut self, _parent: EditorParent) -> Result<(), EditorError> {
             Ok(())
+        }
+
+        fn detach(&mut self) -> Result<(), EditorError> {
+            Ok(())
+        }
+
+        fn set_visible(&mut self, _visible: bool) -> Result<(), EditorError> {
+            Ok(())
+        }
+
+        fn resize(&mut self, size: EditorSize) -> Result<EditorSize, EditorError> {
+            Ok(size)
         }
     }
 
     fn test_app() -> Lilypalooza {
         let (app, _task) = super::super::super::new_with_default_test_state();
         app
+    }
+
+    #[test]
+    fn processor_editor_window_uses_app_drawn_resize_grip_not_native_edges() {
+        let settings = super::processor_editor_window_settings(
+            lilypalooza_audio::EditorDescriptor {
+                default_size: EditorSize {
+                    width: 640,
+                    height: 480,
+                },
+                min_size: None,
+                resizable: true,
+            },
+            None,
+        );
+
+        assert!(!settings.resizable);
     }
 
     fn fake_editor_parent() -> EditorParent {
@@ -2587,6 +2693,102 @@ mod tests {
     }
 
     #[test]
+    fn replacing_processor_with_open_editor_waits_for_editor_window_close() {
+        let (mut app, target) = app_with_soundfont_track();
+        let window_id = app
+            .processor_editor_windows
+            .window_for_target(target)
+            .expect("editor window should be pending or open");
+
+        let _ = app.handle_mixer_message(MixerMessage::SelectTrackInstrument(
+            0,
+            crate::app::mixer::InstrumentChoice::None,
+        ));
+
+        assert!(
+            app.playback
+                .as_ref()
+                .expect("playback")
+                .mixer_state()
+                .track(TrackId(0))
+                .expect("track")
+                .instrument_slot()
+                .is_some()
+        );
+
+        let _ = app.handle_window_closed(window_id);
+
+        assert!(
+            app.playback
+                .as_ref()
+                .expect("playback")
+                .mixer_state()
+                .track(TrackId(0))
+                .expect("track")
+                .instrument_slot()
+                .is_some()
+        );
+
+        let _ = app.handle_frame(std::time::Instant::now());
+
+        assert!(
+            app.playback
+                .as_ref()
+                .expect("playback")
+                .mixer_state()
+                .track(TrackId(0))
+                .expect("track")
+                .instrument_slot()
+                .is_some_and(SlotState::is_empty)
+        );
+    }
+
+    #[test]
+    fn replacing_processor_with_hidden_editor_does_not_wait_for_window_close_event() {
+        let (mut app, target) = app_with_soundfont_track();
+        let _ = app.processor_editor_windows.remove_target(target);
+        let detached = Rc::new(RefCell::new(0));
+        attach_recording_editor(&mut app, target, Rc::clone(&detached));
+        let window_id = app
+            .processor_editor_windows
+            .window_for_target(target)
+            .expect("editor should exist");
+        app.processor_editor_windows
+            .hide_window(window_id)
+            .expect("editor should hide");
+
+        let _ = app.handle_mixer_message(MixerMessage::SelectTrackInstrument(
+            0,
+            crate::app::mixer::InstrumentChoice::None,
+        ));
+
+        assert_eq!(*detached.borrow(), 1);
+        assert!(
+            app.playback
+                .as_ref()
+                .expect("playback")
+                .mixer_state()
+                .track(TrackId(0))
+                .expect("track")
+                .instrument_slot()
+                .is_some()
+        );
+
+        let _ = app.handle_frame(std::time::Instant::now());
+
+        assert!(
+            app.playback
+                .as_ref()
+                .expect("playback")
+                .mixer_state()
+                .track(TrackId(0))
+                .expect("track")
+                .instrument_slot()
+                .is_some_and(SlotState::is_empty)
+        );
+    }
+
+    #[test]
     fn processor_frame_save_command_creates_user_preset_for_slot() {
         let (mut app, target) = app_with_soundfont_track();
 
@@ -2962,8 +3164,34 @@ mod tests {
 
         assert_eq!(settings.size, Size::new(936.0, 612.0));
         assert_eq!(settings.min_size, Some(Size::new(320.0, 220.0)));
-        assert!(settings.resizable);
         assert!(!settings.decorations);
+    }
+
+    #[test]
+    fn open_processor_editor_defers_initial_size_until_parent_attach() {
+        let mut app = test_app();
+        let calls = Rc::new(RefCell::new(0));
+
+        let _ = app.open_editor(
+            EditorTarget {
+                strip_index: 1,
+                slot_index: 0,
+            },
+            "Track 1".to_string(),
+            Some(lilypalooza_audio::EditorDescriptor {
+                default_size: EditorSize {
+                    width: 720,
+                    height: 480,
+                },
+                min_size: None,
+                resizable: true,
+            }),
+            Ok(Some(Box::new(InitialSizeEditorSession {
+                calls: Rc::clone(&calls),
+            }))),
+        );
+
+        assert_eq!(*calls.borrow(), 0);
     }
 
     #[test]

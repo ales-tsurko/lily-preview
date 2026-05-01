@@ -678,6 +678,7 @@ struct ClapRuntimeInner {
     process: unsafe extern "C" fn(*const clap_plugin, *const clap_process) -> i32,
     activated: bool,
     processing: bool,
+    destroyed: bool,
 }
 
 // SAFETY: The runtime is always shared behind a `Mutex`; raw CLAP pointers are accessed only while
@@ -724,12 +725,16 @@ impl ClapRuntimeInner {
             process,
             activated: false,
             processing: false,
+            destroyed: false,
         };
         runtime.activate(sample_rate, block_size)?;
         Ok(runtime)
     }
 
     fn activate(&mut self, sample_rate: usize, block_size: usize) -> Result<(), ClapRuntimeError> {
+        if self.destroyed {
+            return Err(ClapRuntimeError::PluginInitFailed);
+        }
         // SAFETY: `plugin` is a live CLAP plugin pointer.
         let plugin = unsafe { self.plugin.as_ref() };
         if let Some(activate) = plugin.activate {
@@ -757,6 +762,9 @@ impl ClapRuntimeInner {
     }
 
     fn plugin_extension<T>(&self, id: &CStr) -> Option<&T> {
+        if self.destroyed {
+            return None;
+        }
         // SAFETY: `plugin` is live and extension pointer is checked for null.
         let plugin = unsafe { self.plugin.as_ref() };
         let get_extension = plugin.get_extension?;
@@ -774,6 +782,9 @@ impl ClapRuntimeInner {
         output_right: &mut [f32],
         events: &[clap_event_midi],
     ) -> bool {
+        if self.destroyed {
+            return false;
+        }
         let _ = clap_flush_params_if_requested(
             &self.host,
             self.plugin.as_ptr(),
@@ -830,6 +841,9 @@ impl ClapRuntimeInner {
     }
 
     fn reset(&mut self) {
+        if self.destroyed {
+            return;
+        }
         // SAFETY: `plugin` is live while the runtime exists.
         if let Some(reset) = unsafe { self.plugin.as_ref() }.reset {
             // SAFETY: Reset is a CLAP callback on a live plugin.
@@ -895,6 +909,33 @@ impl ClapRuntimeInner {
             ))
         }
     }
+
+    fn prepare_destroy(&mut self) {
+        if self.destroyed {
+            return;
+        }
+        // SAFETY: `plugin` is live until `destroy` is called below.
+        let plugin = unsafe { self.plugin.as_ref() };
+        if self.processing
+            && let Some(stop_processing) = plugin.stop_processing
+        {
+            // SAFETY: Called once before deactivation/destroy.
+            unsafe { stop_processing(self.plugin.as_ptr()) };
+        }
+        self.processing = false;
+        if self.activated
+            && let Some(deactivate) = plugin.deactivate
+        {
+            // SAFETY: Paired with successful activation.
+            unsafe { deactivate(self.plugin.as_ptr()) };
+        }
+        self.activated = false;
+        if let Some(destroy) = plugin.destroy {
+            // SAFETY: Final plugin lifecycle call. No further plugin access happens after this.
+            unsafe { destroy(self.plugin.as_ptr()) };
+        }
+        self.destroyed = true;
+    }
 }
 
 impl LoadedModule {
@@ -916,24 +957,7 @@ impl LoadedModule {
 
 impl Drop for ClapRuntimeInner {
     fn drop(&mut self) {
-        // SAFETY: `plugin` is live until `destroy` is called below.
-        let plugin = unsafe { self.plugin.as_ref() };
-        if self.processing
-            && let Some(stop_processing) = plugin.stop_processing
-        {
-            // SAFETY: Called once before deactivation/destroy.
-            unsafe { stop_processing(self.plugin.as_ptr()) };
-        }
-        if self.activated
-            && let Some(deactivate) = plugin.deactivate
-        {
-            // SAFETY: Paired with successful activation.
-            unsafe { deactivate(self.plugin.as_ptr()) };
-        }
-        if let Some(destroy) = plugin.destroy {
-            // SAFETY: Final plugin lifecycle call. No further plugin access happens after this.
-            unsafe { destroy(self.plugin.as_ptr()) };
-        }
+        self.prepare_destroy();
     }
 }
 
@@ -1064,6 +1088,13 @@ impl RuntimeBinding for ClapBinding {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .latency_samples()
+    }
+
+    fn prepare_destroy(&self) {
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prepare_destroy();
     }
 }
 
@@ -1360,35 +1391,6 @@ struct ClapEditorSession {
 
 impl EditorSession for ClapEditorSession {
     fn initial_size(&mut self) -> Result<Option<EditorSize>, EditorError> {
-        if let Some(size) = self.initial_size {
-            return Ok(Some(size));
-        }
-        let runtime = self
-            .shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let gui = runtime
-            .plugin_extension::<clap_plugin_gui>(CLAP_EXT_GUI)
-            .ok_or(EditorError::Unsupported)?;
-        let api = clap_gui_api_for_platform()?;
-        if let Some(is_api_supported) = gui.is_api_supported {
-            // SAFETY: GUI extension table and API string are valid for this live plugin.
-            if unsafe { !is_api_supported(runtime.plugin.as_ptr(), api, false) } {
-                return Err(EditorError::Unsupported);
-            }
-        }
-        if !self.created {
-            let create = gui.create.ok_or(EditorError::Unsupported)?;
-            // SAFETY: GUI is created once with an API supported by the host platform.
-            if unsafe { !create(runtime.plugin.as_ptr(), api, false) } {
-                return Err(EditorError::Backend("CLAP GUI creation failed".to_string()));
-            }
-            self.created = true;
-        }
-        self.initial_size = runtime
-            .host
-            .take_requested_gui_size()
-            .or_else(|| clap_gui_reported_size(gui, runtime.plugin.as_ptr()));
         Ok(self.initial_size)
     }
 
@@ -1447,16 +1449,7 @@ impl EditorSession for ClapEditorSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(gui) = runtime.plugin_extension::<clap_plugin_gui>(CLAP_EXT_GUI) {
-            if let Some(hide) = gui.hide {
-                // SAFETY: GUI belongs to this live plugin.
-                unsafe { hide(runtime.plugin.as_ptr()) };
-            }
-            if self.created
-                && let Some(destroy) = gui.destroy
-            {
-                // SAFETY: Destroy is paired with successful GUI creation.
-                unsafe { destroy(runtime.plugin.as_ptr()) };
-            }
+            clap_gui_destroy_created(gui, runtime.plugin.as_ptr(), self.created);
         }
         self.created = false;
         self.attached = false;
@@ -1464,48 +1457,35 @@ impl EditorSession for ClapEditorSession {
     }
 
     fn set_visible(&mut self, visible: bool) -> Result<(), EditorError> {
-        let runtime = self
-            .shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(gui) = runtime.plugin_extension::<clap_plugin_gui>(CLAP_EXT_GUI) else {
-            return Ok(());
-        };
-        let ok = if visible {
-            gui.show.map(|show| {
-                // SAFETY: GUI belongs to this live plugin.
-                unsafe { show(runtime.plugin.as_ptr()) }
-            })
-        } else {
-            gui.hide.map(|hide| {
-                // SAFETY: GUI belongs to this live plugin.
-                unsafe { hide(runtime.plugin.as_ptr()) }
-            })
-        };
-        if ok.unwrap_or(true) {
-            Ok(())
-        } else {
-            Err(EditorError::Backend(
-                "CLAP GUI visibility failed".to_string(),
-            ))
-        }
+        clap_gui_set_embedded_visible(visible)
     }
 
-    fn resize(&mut self, size: EditorSize) -> Result<(), EditorError> {
+    fn resize(&mut self, size: EditorSize) -> Result<EditorSize, EditorError> {
         let runtime = self
             .shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(gui) = runtime.plugin_extension::<clap_plugin_gui>(CLAP_EXT_GUI) else {
-            return Ok(());
+            return Ok(size);
         };
         let mut size = size;
         if !clap_gui_adjusted_resize(gui, runtime.plugin.as_ptr(), &mut size) {
-            return Ok(());
+            return Ok(size);
         }
         self.initial_size = Some(size);
-        Ok(())
+        Ok(size)
     }
+}
+
+fn clap_gui_destroy_created(gui: &clap_plugin_gui, plugin: *const clap_plugin, created: bool) {
+    if created && let Some(destroy) = gui.destroy {
+        // SAFETY: Destroy is paired with successful GUI creation.
+        unsafe { destroy(plugin) };
+    }
+}
+
+fn clap_gui_set_embedded_visible(_visible: bool) -> Result<(), EditorError> {
+    Ok(())
 }
 
 impl Drop for ClapEditorSession {
@@ -1559,28 +1539,6 @@ fn clap_gui_adjusted_resize(
 
     *size = EditorSize { width, height };
     true
-}
-
-fn clap_gui_api_for_platform() -> Result<*const c_char, EditorError> {
-    #[cfg(target_os = "macos")]
-    {
-        Ok(CLAP_WINDOW_API_COCOA.as_ptr())
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        Ok(CLAP_WINDOW_API_WIN32.as_ptr())
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        Ok(CLAP_WINDOW_API_X11.as_ptr())
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
-    {
-        Err(EditorError::Unsupported)
-    }
 }
 
 fn clap_window_for_parent(parent: EditorParent) -> Result<clap_window, EditorError> {
@@ -1988,7 +1946,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clap_gui_destroy_created_does_not_hide_embedded_gui() {
+        GUI_DESTROY_COUNT.store(0, Ordering::Release);
+        GUI_HIDE_COUNT.store(0, Ordering::Release);
+
+        clap_gui_destroy_created(
+            &DESTROY_TRACKING_PLUGIN_GUI,
+            NonNull::<clap_plugin>::dangling().as_ptr(),
+            true,
+        );
+
+        assert_eq!(GUI_DESTROY_COUNT.load(Ordering::Acquire), 1);
+        assert_eq!(GUI_HIDE_COUNT.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn clap_embedded_visibility_is_host_window_only() {
+        assert!(clap_gui_set_embedded_visible(false).is_ok());
+        assert!(clap_gui_set_embedded_visible(true).is_ok());
+    }
+
     static PARAM_FLUSH_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static GUI_DESTROY_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static GUI_HIDE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "C" fn test_params_flush(
         _: *const clap_plugin,
@@ -2029,6 +2010,12 @@ mod tests {
         ..SIZED_PLUGIN_GUI
     };
 
+    static DESTROY_TRACKING_PLUGIN_GUI: clap_plugin_gui = clap_plugin_gui {
+        destroy: Some(destroy_tracking_plugin_gui_destroy),
+        hide: Some(destroy_tracking_plugin_gui_hide),
+        ..SIZED_PLUGIN_GUI
+    };
+
     unsafe extern "C" fn non_resizable_plugin_gui_can_resize(_: *const clap_plugin) -> bool {
         false
     }
@@ -2056,6 +2043,15 @@ mod tests {
         height: u32,
     ) -> bool {
         width == 936 && height == 612
+    }
+
+    unsafe extern "C" fn destroy_tracking_plugin_gui_destroy(_: *const clap_plugin) {
+        GUI_DESTROY_COUNT.fetch_add(1, Ordering::AcqRel);
+    }
+
+    unsafe extern "C" fn destroy_tracking_plugin_gui_hide(_: *const clap_plugin) -> bool {
+        GUI_HIDE_COUNT.fetch_add(1, Ordering::AcqRel);
+        true
     }
 
     unsafe extern "C" fn sized_plugin_gui_get_size(
@@ -2134,6 +2130,17 @@ mod tests {
                 resizable: false,
                 ..DEFAULT_CLAP_EDITOR_DESCRIPTOR
             })
+        );
+    }
+
+    #[test]
+    fn clap_editor_default_size_uses_conservative_host_fallback() {
+        assert_eq!(
+            DEFAULT_CLAP_EDITOR_DESCRIPTOR.default_size,
+            EditorSize {
+                width: 720,
+                height: 480,
+            }
         );
     }
 

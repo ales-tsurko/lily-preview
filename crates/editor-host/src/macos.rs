@@ -54,7 +54,11 @@ pub fn install_editor_host(
         height: requested_bounds.size.height,
     });
 
-    resize_host_window_from_top(&host_window, layout.outer_width, layout.outer_height);
+    resize_host_window_from_top_clamped_to_screen(
+        &host_window,
+        layout.outer_width,
+        layout.outer_height,
+    );
     host_view.setFrameSize(NSSize::new(layout.outer_width, layout.outer_height));
     host_window.setOpaque(false);
     host_window.setBackgroundColor(Some(&NSColor::clearColor()));
@@ -63,6 +67,10 @@ pub fn install_editor_host(
     let frame_host = open_egui_frame(
         *host,
         options,
+        Size {
+            width: requested_bounds.size.width,
+            height: requested_bounds.size.height,
+        },
         layout.outer_width,
         layout.outer_height,
         frame,
@@ -89,6 +97,7 @@ pub fn install_editor_host(
         close_requested: frame_host.close_requested,
         title: frame_host.title,
         preset_state: frame_host.preset_state,
+        frame_content_size: frame_host.content_size,
         frame_commands: frame_host.frame_commands,
         frame_window: Some(frame_host.window),
         content_size: Size {
@@ -116,7 +125,11 @@ pub fn resize_installed_host(
     let host_window = host_view
         .window()
         .ok_or_else(|| Error::Message("host window is missing".to_string()))?;
-    resize_host_window_from_bottom(&host_window, layout.outer_width, layout.outer_height);
+    resize_host_window_from_bottom_clamped_to_screen(
+        &host_window,
+        layout.outer_width,
+        layout.outer_height,
+    );
     host_view.setFrameSize(NSSize::new(layout.outer_width, layout.outer_height));
 
     let content_view = ns_view_from_snapshot(content)?;
@@ -245,11 +258,9 @@ fn configure_window(window: &NSWindow, options: &EditorHostOptions, mtm: MainThr
     let mut style_mask = window.styleMask();
     style_mask.insert(NSWindowStyleMask::Closable);
     style_mask.remove(NSWindowStyleMask::Miniaturizable);
-    if options.resizable {
-        style_mask.insert(NSWindowStyleMask::Resizable);
-    } else {
-        style_mask.remove(NSWindowStyleMask::Resizable);
-    }
+    // Resizable editors use the app-drawn bottom-right grip. Native borderless resize zones resize
+    // from any edge and fight plugin resize negotiation.
+    style_mask.remove(NSWindowStyleMask::Resizable);
 
     let collection_behavior = window.collectionBehavior()
         | NSWindowCollectionBehavior::Auxiliary
@@ -282,13 +293,21 @@ pub fn begin_host_window_drag(host: &WindowSnapshot) -> Result<(), Error> {
     Ok(())
 }
 
-fn resize_host_window_from_top(window: &NSWindow, width: f64, height: f64) {
+fn resize_host_window_from_top_clamped_to_screen(window: &NSWindow, width: f64, height: f64) {
     let frame = host_window_frame_resized_from_top(window.frame(), width, height);
+    let frame = window
+        .screen()
+        .map(|screen| host_window_frame_clamped_to_visible_top(frame, screen.visibleFrame()))
+        .unwrap_or(frame);
     window.setFrame_display(frame, false);
 }
 
-fn resize_host_window_from_bottom(window: &NSWindow, width: f64, height: f64) {
+fn resize_host_window_from_bottom_clamped_to_screen(window: &NSWindow, width: f64, height: f64) {
     let frame = host_window_frame_resized_from_bottom(window.frame(), width, height);
+    let frame = window
+        .screen()
+        .map(|screen| host_window_frame_clamped_to_visible_top(frame, screen.visibleFrame()))
+        .unwrap_or(frame);
     window.setFrame_display(frame, false);
 }
 
@@ -304,13 +323,48 @@ fn host_window_frame_resized_from_bottom(mut frame: NSRect, width: f64, height: 
     frame
 }
 
+#[cfg(test)]
+fn host_window_frame_resized_from_bottom_clamped(
+    frame: NSRect,
+    width: f64,
+    height: f64,
+    visible: NSRect,
+) -> NSRect {
+    host_window_frame_clamped_to_visible_top(
+        host_window_frame_resized_from_bottom(frame, width, height),
+        visible,
+    )
+}
+
+fn host_window_frame_clamped_to_visible_top(mut frame: NSRect, visible: NSRect) -> NSRect {
+    let top = frame.origin.y + frame.size.height;
+    let visible_top = visible.origin.y + visible.size.height;
+    if top > visible_top {
+        frame.origin.y = visible_top - frame.size.height;
+    }
+    frame
+}
+
 fn build_content_view(frame: crate::Rect, mtm: MainThreadMarker) -> Retained<NSView> {
     let content = NSView::initWithFrame(NSView::alloc(mtm), ns_rect(frame));
-    content.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    content.setAutoresizingMask(content_view_autoresizing_mask());
+    style_view(
+        &content,
+        &NSColor::clearColor(),
+        None,
+        0.0,
+        0.0,
+        content_view_masks_to_bounds(),
     );
-    style_view(&content, &NSColor::clearColor(), None, 0.0, 0.0);
     content
+}
+
+fn content_view_autoresizing_mask() -> NSAutoresizingMaskOptions {
+    NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable
+}
+
+fn content_view_masks_to_bounds() -> bool {
+    false
 }
 
 fn content_frame_for_host(layout: crate::EditorFrameLayout, host_is_flipped: bool) -> crate::Rect {
@@ -325,7 +379,7 @@ fn content_frame_for_host(layout: crate::EditorFrameLayout, host_is_flipped: boo
 }
 
 fn style_host_view(view: &NSView) {
-    style_view(view, &NSColor::clearColor(), None, 0.0, 0.0);
+    style_view(view, &NSColor::clearColor(), None, 0.0, 0.0, false);
 }
 
 fn style_view(
@@ -334,6 +388,7 @@ fn style_view(
     border: Option<&NSColor>,
     corner_radius: f64,
     border_width: f64,
+    masks_to_bounds: bool,
 ) {
     view.setWantsLayer(true);
     let layer = CALayer::layer();
@@ -345,7 +400,7 @@ fn style_view(
     }
     layer.setBorderWidth(border_width);
     layer.setCornerRadius(corner_radius);
-    layer.setMasksToBounds(corner_radius > 0.0);
+    layer.setMasksToBounds(masks_to_bounds || corner_radius > 0.0);
     view.setLayer(Some(&layer));
 }
 
@@ -359,10 +414,12 @@ fn ns_rect(frame: crate::Rect) -> NSRect {
 #[cfg(test)]
 mod tests {
     use crate::{Rect, host_layout};
+    use objc2_app_kit::NSAutoresizingMaskOptions;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     use super::{
-        content_frame_for_host, host_window_frame_resized_from_bottom,
+        content_frame_for_host, content_view_autoresizing_mask, content_view_masks_to_bounds,
+        host_window_frame_resized_from_bottom, host_window_frame_resized_from_bottom_clamped,
         host_window_frame_resized_from_top,
     };
 
@@ -404,6 +461,29 @@ mod tests {
 
         assert_eq!(resized.origin.y, 200.0);
         assert_eq!(resized.size.height, 500.0);
+    }
+
+    #[test]
+    fn live_resize_clamps_header_top_to_visible_screen() {
+        let frame = NSRect::new(NSPoint::new(100.0, 200.0), NSSize::new(440.0, 400.0));
+        let visible = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0));
+
+        let resized = host_window_frame_resized_from_bottom_clamped(frame, 440.0, 1000.0, visible);
+
+        assert_eq!(resized.origin.y + resized.size.height, 900.0);
+    }
+
+    #[test]
+    fn content_host_view_autoresizes_with_plugin_owned_resize() {
+        let mask = content_view_autoresizing_mask();
+
+        assert!(mask.contains(NSAutoresizingMaskOptions::ViewWidthSizable));
+        assert!(mask.contains(NSAutoresizingMaskOptions::ViewHeightSizable));
+    }
+
+    #[test]
+    fn content_host_view_does_not_clip_plugin_owned_resize() {
+        assert!(!content_view_masks_to_bounds());
     }
 
     #[test]
