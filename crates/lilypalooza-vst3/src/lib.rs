@@ -83,6 +83,12 @@ pub enum Vst3ProbeError {
         /// Loader error.
         error: libloading::Error,
     },
+    /// macOS bundle object could not be created.
+    #[error("failed to create VST3 bundle for {0}")]
+    MissingBundle(PathBuf),
+    /// macOS bundle executable could not be loaded.
+    #[error("failed to load VST3 bundle executable for {0}")]
+    BundleLoadFailed(PathBuf),
     /// Required exported symbol is missing.
     #[error("missing VST3 export `{0}`")]
     MissingExport(&'static str),
@@ -353,10 +359,11 @@ fn zeroed<T>() -> T {
 }
 
 struct LoadedModule {
-    _library: libloading::Library,
     factory: ComPtr<IPluginFactory>,
     #[cfg(target_os = "macos")]
-    _bundle: Option<core_foundation::bundle::CFBundle>,
+    _bundle: core_foundation::bundle::CFBundle,
+    #[cfg(not(target_os = "macos"))]
+    _library: libloading::Library,
 }
 
 // SAFETY: The library and COM factory remain loaded for process lifetime through `LOADED_MODULES`.
@@ -365,11 +372,16 @@ unsafe impl Send for LoadedModule {}
 unsafe impl Sync for LoadedModule {}
 
 type GetPluginFactory = unsafe extern "system" fn() -> *mut IPluginFactory;
+#[cfg(target_os = "macos")]
 type BundleEntry = unsafe extern "system" fn(*mut c_void) -> bool;
 #[cfg(target_os = "windows")]
 type InitDll = unsafe extern "system" fn() -> bool;
 #[cfg(all(unix, not(target_os = "macos")))]
 type ModuleEntry = unsafe extern "system" fn(*mut c_void) -> bool;
+
+const GET_PLUGIN_FACTORY_SYMBOL: &str = "GetPluginFactory";
+#[cfg(target_os = "macos")]
+const BUNDLE_ENTRY_SYMBOL: &str = "bundleEntry";
 
 fn loaded_modules() -> &'static RwLock<HashMap<PathBuf, Arc<LoadedModule>>> {
     static LOADED_MODULES: OnceLock<RwLock<HashMap<PathBuf, Arc<LoadedModule>>>> = OnceLock::new();
@@ -393,7 +405,19 @@ fn load_module(path: &Path, library_path: &Path) -> Result<Arc<LoadedModule>, Vs
     Ok(module)
 }
 
-fn load_module_uncached(path: &Path, library_path: &Path) -> Result<LoadedModule, Vst3ProbeError> {
+fn load_module_uncached(path: &Path, _library_path: &Path) -> Result<LoadedModule, Vst3ProbeError> {
+    #[cfg(target_os = "macos")]
+    {
+        load_macos_module(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        load_dynamic_module(path, _library_path)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_dynamic_module(_path: &Path, library_path: &Path) -> Result<LoadedModule, Vst3ProbeError> {
     // SAFETY: Loading a plugin library is isolated by the validator subprocess during scanning.
     let library = unsafe { libloading::Library::new(library_path) }.map_err(|error| {
         Vst3ProbeError::LoadLibrary {
@@ -402,8 +426,6 @@ fn load_module_uncached(path: &Path, library_path: &Path) -> Result<LoadedModule
         }
     })?;
 
-    #[cfg(target_os = "macos")]
-    let bundle = call_macos_bundle_entry(path, &library)?;
     #[cfg(target_os = "windows")]
     call_windows_init(&library)?;
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -417,20 +439,16 @@ fn load_module_uncached(path: &Path, library_path: &Path) -> Result<LoadedModule
     // SAFETY: `GetPluginFactory` returns an owning COM pointer when non-null.
     let factory = unsafe { ComPtr::from_raw(factory) }.ok_or(Vst3ProbeError::MissingFactory)?;
     Ok(LoadedModule {
-        _library: library,
         factory,
-        #[cfg(target_os = "macos")]
-        _bundle: bundle,
+        _library: library,
     })
 }
 
 #[cfg(target_os = "macos")]
-fn call_macos_bundle_entry(
-    path: &Path,
-    library: &libloading::Library,
-) -> Result<Option<core_foundation::bundle::CFBundle>, Vst3ProbeError> {
+fn load_macos_module(path: &Path) -> Result<LoadedModule, Vst3ProbeError> {
     use core_foundation::base::TCFType;
     use core_foundation::bundle::CFBundle;
+    use core_foundation::bundle::CFBundleLoadExecutable;
     use core_foundation::string::CFString;
     use core_foundation::url::{CFURL, kCFURLPOSIXPathStyle};
 
@@ -438,19 +456,47 @@ fn call_macos_bundle_entry(
         CFString::new(&path.display().to_string()),
         kCFURLPOSIXPathStyle,
         true,
-    ));
-    // SAFETY: Symbol lookup uses a static NUL-terminated export name.
-    if let Ok(entry) = unsafe { library.get::<BundleEntry>(b"BundleEntry\0") } {
-        let bundle_ref = bundle
-            .as_ref()
-            .map(|bundle| bundle.as_concrete_TypeRef() as *mut c_void)
-            .unwrap_or(std::ptr::null_mut());
-        // SAFETY: BundleEntry is an optional VST3 module initializer.
-        if !unsafe { entry(bundle_ref) } {
-            return Err(Vst3ProbeError::MissingExport("BundleEntry"));
-        }
+    ))
+    .ok_or_else(|| Vst3ProbeError::MissingBundle(path.to_path_buf()))?;
+
+    // SAFETY: VST3 macOS modules must be loaded via CFBundleLoadExecutable before bundleEntry.
+    if unsafe { CFBundleLoadExecutable(bundle.as_concrete_TypeRef()) } == 0 {
+        return Err(Vst3ProbeError::BundleLoadFailed(path.to_path_buf()));
     }
-    Ok(bundle)
+
+    let entry = macos_bundle_symbol::<BundleEntry>(&bundle, BUNDLE_ENTRY_SYMBOL)
+        .ok_or(Vst3ProbeError::MissingExport(BUNDLE_ENTRY_SYMBOL))?;
+    let bundle_ref = bundle.as_concrete_TypeRef() as *mut c_void;
+    // SAFETY: bundleEntry is the required VST3 macOS module initializer.
+    if !unsafe { entry(bundle_ref) } {
+        return Err(Vst3ProbeError::MissingExport(BUNDLE_ENTRY_SYMBOL));
+    }
+
+    let get_factory = macos_bundle_symbol::<GetPluginFactory>(&bundle, GET_PLUGIN_FACTORY_SYMBOL)
+        .ok_or(Vst3ProbeError::MissingExport(GET_PLUGIN_FACTORY_SYMBOL))?;
+    // SAFETY: Factory export is called after module initialization.
+    let factory = unsafe { get_factory() };
+    // SAFETY: `GetPluginFactory` returns an owning COM pointer when non-null.
+    let factory = unsafe { ComPtr::from_raw(factory) }.ok_or(Vst3ProbeError::MissingFactory)?;
+    Ok(LoadedModule {
+        factory,
+        _bundle: bundle,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_bundle_symbol<T>(bundle: &core_foundation::bundle::CFBundle, symbol: &str) -> Option<T>
+where
+    T: Copy,
+{
+    use core_foundation::string::CFString;
+
+    let pointer = bundle.function_pointer_for_name(CFString::new(symbol));
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: The caller chooses `T` to match the named C symbol signature.
+    Some(unsafe { std::mem::transmute_copy::<*const c_void, T>(&pointer) })
 }
 
 #[cfg(target_os = "windows")]
@@ -647,9 +693,36 @@ struct Vst3RuntimeInner {
     component_connection: Option<ComPtr<IConnectionPoint>>,
     controller_connection: Option<ComPtr<IConnectionPoint>>,
     descriptor: &'static ProcessorDescriptor,
+    controller_lifecycle: Option<ControllerLifecycle>,
     active: bool,
     processing: bool,
     destroyed: bool,
+    process_trace_remaining: u8,
+}
+
+struct CreatedController {
+    controller: ComPtr<IEditController>,
+    lifecycle: ControllerLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControllerLifecycle {
+    ComponentIntegrated,
+    Separate,
+}
+
+impl ControllerLifecycle {
+    fn initializes_controller(self) -> bool {
+        matches!(self, Self::Separate)
+    }
+
+    fn connects_component(self) -> bool {
+        matches!(self, Self::Separate)
+    }
+
+    fn terminates_controller(self) -> bool {
+        matches!(self, Self::Separate)
+    }
 }
 
 // SAFETY: The runtime is always shared behind a `Mutex`; raw VST3 pointers are accessed only
@@ -664,6 +737,13 @@ impl Vst3RuntimeInner {
         block_size: usize,
         role: registry::Role,
     ) -> Result<Self, Vst3RuntimeError> {
+        trace_vst3(|| {
+            format!(
+                "instantiate start name={} role={role:?} path={}",
+                metadata.name,
+                metadata.path.display()
+            )
+        });
         let module = load_module(&metadata.path, &metadata.library_path)?;
         let class_id = hex_to_tuid(&metadata.class_id)
             .ok_or_else(|| Vst3RuntimeError::InvalidClassId(metadata.class_id.clone()))?;
@@ -672,6 +752,7 @@ impl Vst3RuntimeInner {
             .to_com_ptr::<IHostApplication>()
             .ok_or(Vst3RuntimeError::InitializeFailed)?;
         let mut component_raw = std::ptr::null_mut::<c_void>();
+        trace_vst3(|| "instantiate createInstance IComponent start".to_string());
         // SAFETY: Factory is live and writes the requested processor COM pointer.
         unsafe {
             module.factory.createInstance(
@@ -680,19 +761,26 @@ impl Vst3RuntimeInner {
                 &mut component_raw,
             )
         };
+        trace_vst3(|| "instantiate createInstance IComponent done".to_string());
         // SAFETY: Successful factory creation returns an owning IComponent pointer.
         let component = unsafe { ComPtr::from_raw(component_raw.cast::<IComponent>()) }
             .ok_or(Vst3RuntimeError::CreateProcessorFailed)?;
+        trace_vst3(|| "instantiate component.initialize start".to_string());
         // SAFETY: Component is initialized once with a live host application object.
         if unsafe { component.initialize(host_application.as_ptr().cast()) } != kResultOk {
             return Err(Vst3RuntimeError::InitializeFailed);
         }
+        trace_vst3(|| "instantiate component.initialize done".to_string());
         let processor = component
             .cast::<IAudioProcessor>()
             .ok_or(Vst3RuntimeError::MissingAudioProcessor)?;
-        let controller = create_controller(&module.factory, &component, &host)?;
+        trace_vst3(|| "instantiate create_controller start".to_string());
+        let created_controller = create_controller(&module.factory, &component, &host)?;
+        trace_vst3(|| "instantiate create_controller done".to_string());
+        let controller_lifecycle = created_controller.as_ref().map(|created| created.lifecycle);
+        let controller = created_controller.map(|created| created.controller);
         let (component_connection, controller_connection) =
-            connect_component_and_controller(&component, controller.as_ref());
+            connect_component_and_controller(&component, controller.as_ref(), controller_lifecycle);
 
         let mut runtime = Self {
             _module: module,
@@ -703,11 +791,14 @@ impl Vst3RuntimeInner {
             component_connection,
             controller_connection,
             descriptor,
+            controller_lifecycle,
             active: false,
             processing: false,
             destroyed: false,
+            process_trace_remaining: 8,
         };
         runtime.configure_audio(sample_rate, block_size, role)?;
+        trace_vst3(|| "instantiate done".to_string());
         Ok(runtime)
     }
 
@@ -719,12 +810,14 @@ impl Vst3RuntimeInner {
     ) -> Result<(), Vst3RuntimeError> {
         // SAFETY: Component/processor are initialized and bus setup uses stack-owned values.
         unsafe {
+            trace_vst3(|| "configure_audio setBusArrangements start".to_string());
             let mut input = SpeakerArr::kStereo;
             let mut output = SpeakerArr::kStereo;
             let input_count = i32::from(role == registry::Role::Effect);
             let _ = self
                 .processor
                 .setBusArrangements(&mut input, input_count, &mut output, 1);
+            trace_vst3(|| "configure_audio activate buses start".to_string());
             activate_buses(
                 &self.component,
                 MediaTypes_::kAudio as MediaType,
@@ -747,17 +840,22 @@ impl Vst3RuntimeInner {
                 maxSamplesPerBlock: block_size.max(1) as int32,
                 sampleRate: sample_rate.max(1) as SampleRate,
             };
+            trace_vst3(|| "configure_audio setupProcessing start".to_string());
             if self.processor.setupProcessing(&mut setup) != kResultOk {
                 return Err(Vst3RuntimeError::SetupFailed);
             }
+            trace_vst3(|| "configure_audio setupProcessing done".to_string());
+            trace_vst3(|| "configure_audio setActive(1) start".to_string());
             if self.component.setActive(1) != kResultOk {
                 return Err(Vst3RuntimeError::ActivateFailed);
             }
             self.active = true;
+            trace_vst3(|| "configure_audio setProcessing(1) start".to_string());
             if self.processor.setProcessing(1) != kResultOk {
                 return Err(Vst3RuntimeError::ActivateFailed);
             }
             self.processing = true;
+            trace_vst3(|| "configure_audio done".to_string());
         }
         Ok(())
     }
@@ -834,8 +932,22 @@ impl Vst3RuntimeInner {
                 .map_or(std::ptr::null_mut(), ComPtr::as_ptr),
             processContext: std::ptr::null_mut(),
         };
+        if self.process_trace_remaining > 0 {
+            trace_vst3(|| {
+                format!(
+                    "process start frames={frames} inputs={} events={}",
+                    data.numInputs,
+                    events.len()
+                )
+            });
+        }
         // SAFETY: ProcessData points to buffers and COM lists that outlive this process call.
-        unsafe { self.processor.process(&mut data) == kResultOk }
+        let result = unsafe { self.processor.process(&mut data) == kResultOk };
+        if self.process_trace_remaining > 0 {
+            self.process_trace_remaining -= 1;
+            trace_vst3(|| format!("process done result={result}"));
+        }
+        result
     }
 
     fn reset(&mut self) {}
@@ -857,38 +969,56 @@ impl Vst3RuntimeInner {
         if self.destroyed {
             return;
         }
+        trace_vst3(|| "prepare_destroy start".to_string());
         // SAFETY: Lifecycle calls are paired with successful initialization/activation.
         unsafe {
             if self.processing {
+                trace_vst3(|| "prepare_destroy setProcessing(0) start".to_string());
                 let _ = self.processor.setProcessing(0);
             }
             self.processing = false;
             if self.active {
+                trace_vst3(|| "prepare_destroy setActive(0) start".to_string());
                 let _ = self.component.setActive(0);
             }
             self.active = false;
-            if let (Some(component), Some(controller)) =
-                (&self.component_connection, &self.controller_connection)
+            if self
+                .controller_lifecycle
+                .is_some_and(ControllerLifecycle::connects_component)
+                && let (Some(component), Some(controller)) =
+                    (&self.component_connection, &self.controller_connection)
             {
+                trace_vst3(|| "prepare_destroy disconnect start".to_string());
                 let _ = component.disconnect(controller.as_ptr());
                 let _ = controller.disconnect(component.as_ptr());
             }
-            if let Some(controller) = &self.controller {
+            if self
+                .controller_lifecycle
+                .is_some_and(ControllerLifecycle::terminates_controller)
+                && let Some(controller) = &self.controller
+            {
+                trace_vst3(|| "prepare_destroy controller.terminate start".to_string());
                 let _ = controller.terminate();
             }
+            trace_vst3(|| "prepare_destroy component.terminate start".to_string());
             let _ = self.component.terminate();
         }
         self.destroyed = true;
+        trace_vst3(|| "prepare_destroy done".to_string());
     }
 }
 
 fn connect_component_and_controller(
     component: &ComPtr<IComponent>,
     controller: Option<&ComPtr<IEditController>>,
+    controller_lifecycle: Option<ControllerLifecycle>,
 ) -> (
     Option<ComPtr<IConnectionPoint>>,
     Option<ComPtr<IConnectionPoint>>,
 ) {
+    if !controller_lifecycle.is_some_and(ControllerLifecycle::connects_component) {
+        return (None, None);
+    }
     let component_connection = component.cast::<IConnectionPoint>();
     let controller_connection =
         controller.and_then(|controller| controller.cast::<IConnectionPoint>());
@@ -914,17 +1044,24 @@ fn create_controller(
     factory: &ComPtr<IPluginFactory>,
     component: &ComPtr<IComponent>,
     host: &ComWrapper<Vst3Host>,
-) -> Result<Option<ComPtr<IEditController>>, Vst3RuntimeError> {
+) -> Result<Option<CreatedController>, Vst3RuntimeError> {
     if let Some(controller) = component.cast::<IEditController>() {
-        initialize_controller(&controller, host)?;
-        return Ok(Some(controller));
+        trace_vst3(|| "create_controller component has IEditController".to_string());
+        set_controller_component_handler(&controller, host)?;
+        return Ok(Some(CreatedController {
+            controller,
+            lifecycle: ControllerLifecycle::ComponentIntegrated,
+        }));
     }
     let mut controller_id = [0 as c_char; 16];
+    trace_vst3(|| "create_controller getControllerClassId start".to_string());
     // SAFETY: Component writes the controller class id into the provided TUID.
     if unsafe { component.getControllerClassId(&mut controller_id) } != kResultOk {
+        trace_vst3(|| "create_controller no controller class id".to_string());
         return Ok(None);
     }
     let mut controller_raw = std::ptr::null_mut::<c_void>();
+    trace_vst3(|| "create_controller factory.createInstance IEditController start".to_string());
     // SAFETY: Factory is live and writes an optional controller COM pointer.
     unsafe {
         factory.createInstance(
@@ -933,13 +1070,21 @@ fn create_controller(
             &mut controller_raw,
         )
     };
+    trace_vst3(|| "create_controller factory.createInstance IEditController done".to_string());
     // SAFETY: Successful controller creation returns an owning IEditController pointer.
     let Some(controller) = (unsafe { ComPtr::from_raw(controller_raw.cast::<IEditController>()) })
     else {
+        trace_vst3(|| "create_controller factory returned null".to_string());
         return Ok(None);
     };
-    initialize_controller(&controller, host)?;
-    Ok(Some(controller))
+    let lifecycle = ControllerLifecycle::Separate;
+    if lifecycle.initializes_controller() {
+        initialize_controller(&controller, host)?;
+    }
+    Ok(Some(CreatedController {
+        controller,
+        lifecycle,
+    }))
 }
 
 fn initialize_controller(
@@ -949,15 +1094,27 @@ fn initialize_controller(
     let host_application = host
         .to_com_ptr::<IHostApplication>()
         .ok_or(Vst3RuntimeError::InitializeFailed)?;
+    trace_vst3(|| "initialize_controller initialize start".to_string());
     // SAFETY: Controller is initialized once with a live host application object.
     if unsafe { controller.initialize(host_application.as_ptr().cast()) } != kResultOk {
         return Err(Vst3RuntimeError::InitializeFailed);
     }
+    trace_vst3(|| "initialize_controller initialize done".to_string());
+    set_controller_component_handler(controller, host)?;
+    Ok(())
+}
+
+fn set_controller_component_handler(
+    controller: &ComPtr<IEditController>,
+    host: &ComWrapper<Vst3Host>,
+) -> Result<(), Vst3RuntimeError> {
     if let Some(handler) = host.to_com_ptr::<IComponentHandler>() {
+        trace_vst3(|| "initialize_controller setComponentHandler start".to_string());
         // SAFETY: Component handler COM pointer is owned by the host wrapper and remains live.
         unsafe {
             let _ = controller.setComponentHandler(handler.as_ptr());
         }
+        trace_vst3(|| "initialize_controller setComponentHandler done".to_string());
     }
     Ok(())
 }
@@ -1318,8 +1475,10 @@ impl EditorSession for Vst3EditorSession {
             .controller
             .as_ref()
             .ok_or(EditorError::Unsupported)?;
+        trace_vst3(|| "editor attach createView start".to_string());
         // SAFETY: Controller is live and returns an owning view pointer or null.
         let view = unsafe { controller.createView(EDITOR_VIEW_NAME.as_ptr().cast()) };
+        trace_vst3(|| "editor attach createView done".to_string());
         // SAFETY: Non-null view pointer is owned by the caller.
         let view = unsafe { ComPtr::from_raw(view) }.ok_or(EditorError::Unsupported)?;
         let frame = runtime
@@ -1328,15 +1487,21 @@ impl EditorSession for Vst3EditorSession {
             .ok_or(EditorError::Unsupported)?;
         // SAFETY: View, frame, and parent handle are live for the editor window lifetime.
         unsafe {
+            trace_vst3(|| "editor attach setFrame start".to_string());
             let _ = view.setFrame(frame.as_ptr());
+            trace_vst3(|| "editor attach setFrame done".to_string());
+            trace_vst3(|| "editor attach isPlatformTypeSupported start".to_string());
             if view.isPlatformTypeSupported(platform) != kResultOk {
                 return Err(EditorError::Unsupported);
             }
+            trace_vst3(|| "editor attach isPlatformTypeSupported done".to_string());
+            trace_vst3(|| "editor attach attached start".to_string());
             if view.attached(parent, platform) != kResultOk {
                 return Err(EditorError::Backend(
                     "VST3 editor attach failed".to_string(),
                 ));
             }
+            trace_vst3(|| "editor attach attached done".to_string());
         }
         self.current_size = vst3_view_size(&view);
         trace_vst3_editor(|| format!("session attach current_size={:?}", self.current_size));
@@ -1349,8 +1514,12 @@ impl EditorSession for Vst3EditorSession {
             trace_vst3_editor(|| format!("session detach current_size={:?}", self.current_size));
             // SAFETY: View was attached by this session and can be detached once.
             unsafe {
+                trace_vst3(|| "editor detach removed start".to_string());
                 let _ = view.removed();
+                trace_vst3(|| "editor detach removed done".to_string());
+                trace_vst3(|| "editor detach setFrame(null) start".to_string());
                 let _ = view.setFrame(std::ptr::null_mut());
+                trace_vst3(|| "editor detach setFrame(null) done".to_string());
             }
         }
         self.current_size = None;
@@ -1368,9 +1537,18 @@ impl EditorSession for Vst3EditorSession {
         let mut rect = rect_from_editor_size(size);
         // SAFETY: View is live and receives a stack-owned size rectangle.
         unsafe {
+            trace_vst3(|| format!("editor resize canResize start requested={size:?}"));
             if view.canResize() == kResultOk {
+                trace_vst3(|| "editor resize checkSizeConstraint start".to_string());
                 let _ = view.checkSizeConstraint(&mut rect);
+                trace_vst3(|| {
+                    format!(
+                        "editor resize onSize start constrained_rect={}",
+                        format_view_rect(rect)
+                    )
+                });
                 let _ = view.onSize(&mut rect);
+                trace_vst3(|| "editor resize onSize done".to_string());
             }
         }
         let accepted = editor_size_from_rect(rect).unwrap_or(size);
@@ -1386,9 +1564,20 @@ impl EditorSession for Vst3EditorSession {
 }
 
 fn trace_vst3_editor(message: impl FnOnce() -> String) {
-    if std::env::var_os("LILYPALOOZA_EDITOR_HOST_TRACE").is_some() {
-        eprintln!("[vst3-editor] {}", message());
-    }
+    trace_vst3_prefixed("vst3-editor", message);
+}
+
+fn trace_vst3(message: impl FnOnce() -> String) {
+    trace_vst3_prefixed("vst3", message);
+}
+
+fn trace_vst3_prefixed(prefix: &str, message: impl FnOnce() -> String) {
+    log::trace!(
+        target: "lilypalooza_vst3",
+        "{prefix} thread={:?} {}",
+        std::thread::current().id(),
+        message()
+    );
 }
 
 fn changed_editor_size_request(
@@ -1615,6 +1804,13 @@ mod tests {
         assert_eq!(candidates, vec![dir.path().join("Root.vst3"), nested]);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_vst3_loader_uses_sdk_entry_symbol_names() {
+        assert_eq!(GET_PLUGIN_FACTORY_SYMBOL, "GetPluginFactory");
+        assert_eq!(BUNDLE_ENTRY_SYMBOL, "bundleEntry");
+    }
+
     #[test]
     fn stable_processor_id_includes_path_and_class_id() {
         assert_eq!(
@@ -1657,6 +1853,24 @@ mod tests {
             role_from_subcategories(Some("Fx|Delay")),
             registry::Role::Effect
         );
+    }
+
+    #[test]
+    fn component_integrated_controller_uses_component_lifecycle_only() {
+        let lifecycle = ControllerLifecycle::ComponentIntegrated;
+
+        assert!(!lifecycle.initializes_controller());
+        assert!(!lifecycle.connects_component());
+        assert!(!lifecycle.terminates_controller());
+    }
+
+    #[test]
+    fn separate_controller_uses_full_controller_lifecycle() {
+        let lifecycle = ControllerLifecycle::Separate;
+
+        assert!(lifecycle.initializes_controller());
+        assert!(lifecycle.connects_component());
+        assert!(lifecycle.terminates_controller());
     }
 
     #[test]

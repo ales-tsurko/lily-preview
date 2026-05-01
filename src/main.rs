@@ -26,9 +26,14 @@ mod track_names;
 mod ui_style;
 
 fn main() -> iced::Result {
+    init_logging();
     lilypalooza_builtins::register_all();
     let startup = startup_options();
     app::run(startup.soundfont, startup.score, startup.audio_enabled)
+}
+
+fn init_logging() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default()).try_init();
 }
 
 struct StartupOptions {

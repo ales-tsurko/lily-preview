@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 libloading = "0.8.9"
 lilypalooza-audio = { path = "../lilypalooza-audio" }
+log = "0.4.28"
 raw-window-handle = "0.6"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0.18"

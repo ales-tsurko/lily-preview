@@ -399,9 +399,12 @@ enum ResizeAnchor {
 }
 
 fn trace_editor_host(message: impl FnOnce() -> String) {
-    if std::env::var_os("LILYPALOOZA_EDITOR_HOST_TRACE").is_some() {
-        eprintln!("[editor-host] {}", message());
-    }
+    log::trace!(
+        target: "editor_host",
+        "thread={:?} {}",
+        std::thread::current().id(),
+        message()
+    );
 }
 
 #[cfg(test)]

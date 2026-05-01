@@ -570,9 +570,12 @@ impl EditorWindowManager {
 }
 
 fn trace_editor_resize(message: impl FnOnce() -> String) {
-    if std::env::var_os("LILYPALOOZA_EDITOR_HOST_TRACE").is_some() {
-        eprintln!("[editor-windows] {}", message());
-    }
+    log::trace!(
+        target: "lilypalooza::editor_windows",
+        "thread={:?} {}",
+        std::thread::current().id(),
+        message()
+    );
 }
 
 #[cfg(test)]

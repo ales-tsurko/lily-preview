@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 egui = "0.33.3"
 lilypalooza-egui-baseview = { path = "../lilypalooza-egui-baseview" }
+log = "0.4.28"
 raw-window-handle = "0.6"
 thiserror = "2.0.18"
 
