@@ -71,6 +71,18 @@ fn host_size_from_editor_size(size: EditorSize) -> editor_host::Size {
     }
 }
 
+fn editor_content_resize_request(
+    requested: EditorSize,
+    host: &InstalledHost,
+) -> Option<editor_host::Size> {
+    let requested = host_size_from_editor_size(requested);
+    (!same_host_size(requested, host.content_size())).then_some(requested)
+}
+
+fn same_host_size(a: editor_host::Size, b: editor_host::Size) -> bool {
+    (a.width - b.width).abs() < 0.5 && (a.height - b.height).abs() < 0.5
+}
+
 fn negotiate_editor_content_resize(
     session: &mut dyn EditorSession,
     requested: editor_host::Size,
@@ -487,56 +499,30 @@ impl EditorWindowManager {
         commands
     }
 
-    pub(super) fn apply_requested_content_resizes(&mut self) -> Vec<String> {
-        let mut errors = Vec::new();
+    pub(super) fn apply_requested_content_resizes(&mut self, mut on_error: impl FnMut(String)) {
         for window in self.windows.values_mut() {
             match window.session.requested_size() {
                 Ok(Some(size)) => {
                     if let Some(host) = window.host.as_mut()
-                        && let Err(error) = host.resize_content(editor_host::Size {
-                            width: f64::from(size.width),
-                            height: f64::from(size.height),
-                        })
+                        && let Some(content_size) = editor_content_resize_request(size, host)
                     {
-                        errors.push(error.to_string());
+                        trace_editor_resize(|| {
+                            format!(
+                                "app applying requested editor resize requested={size:?} content={content_size:?} host_current={:?}",
+                                host.content_size()
+                            )
+                        });
+                        if let Err(error) = host.resize_content_from_top(content_size) {
+                            on_error(error.to_string());
+                        }
                     }
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    errors.push(error.to_string());
+                    on_error(error.to_string());
                 }
             };
         }
-        errors
-    }
-
-    pub(super) fn resize_window(&mut self, window_id: window::Id, size: iced::Size) -> Vec<String> {
-        let Some(target) = self.windows_by_id.get(&window_id).copied() else {
-            return Vec::new();
-        };
-        let Some(window) = self.windows.get_mut(&target) else {
-            return Vec::new();
-        };
-        if !window.resizable {
-            return Vec::new();
-        }
-        let Some(host) = window.host.as_mut() else {
-            return Vec::new();
-        };
-        let mut errors = Vec::new();
-        let requested_content_size = host.content_size_from_outer_size(editor_host::Size {
-            width: f64::from(size.width),
-            height: f64::from(size.height),
-        });
-        match negotiate_editor_content_resize(window.session.as_mut(), requested_content_size) {
-            Ok(content_size) => {
-                if let Err(error) = host.resize_content(content_size) {
-                    errors.push(error.to_string());
-                }
-            }
-            Err(error) => errors.push(error.to_string()),
-        }
-        errors
     }
 
     pub(super) fn resize_target_content(
@@ -580,6 +566,12 @@ impl EditorWindowManager {
 
     pub(super) fn has_installed_hosts(&self) -> bool {
         self.windows.values().any(|window| window.host.is_some())
+    }
+}
+
+fn trace_editor_resize(message: impl FnOnce() -> String) {
+    if std::env::var_os("LILYPALOOZA_EDITOR_HOST_TRACE").is_some() {
+        eprintln!("[editor-windows] {}", message());
     }
 }
 
@@ -803,7 +795,10 @@ mod tests {
             )
             .expect("attach should succeed");
 
-        assert!(manager.apply_requested_content_resizes().is_empty());
+        let mut errors = Vec::new();
+        manager.apply_requested_content_resizes(|error| errors.push(error));
+
+        assert!(errors.is_empty());
         assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 
@@ -843,6 +838,30 @@ mod tests {
                 height: 384.0,
             }
         );
+    }
+
+    #[test]
+    fn same_host_size_treats_subpixel_resize_as_noop() {
+        assert!(super::same_host_size(
+            editor_host::Size {
+                width: 640.0,
+                height: 480.0,
+            },
+            editor_host::Size {
+                width: 640.25,
+                height: 479.75,
+            },
+        ));
+        assert!(!super::same_host_size(
+            editor_host::Size {
+                width: 640.0,
+                height: 480.0,
+            },
+            editor_host::Size {
+                width: 641.0,
+                height: 480.0,
+            },
+        ));
     }
 
     #[test]

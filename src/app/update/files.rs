@@ -1,6 +1,13 @@
 use super::*;
 use crate::app::editor::EditorTabFileState;
 
+async fn save_plugin_scan_cache(
+    cache: lilypalooza_plugin_scan::PluginScanCache,
+    path: PathBuf,
+) -> Result<(), String> {
+    cache.save_to(&path)
+}
+
 impl Lilypalooza {
     #[cfg_attr(test, allow(dead_code))]
     pub(in crate::app) fn start_plugin_scan(&mut self) {
@@ -25,22 +32,31 @@ impl Lilypalooza {
             .start(self.plugin_search_paths.clone(), cache, validator);
     }
 
-    pub(in crate::app) fn poll_plugin_scan(&mut self) {
-        for event in self.plugin_scan.drain_events() {
+    pub(in crate::app) fn poll_plugin_scan(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for event in self
+            .plugin_scan
+            .drain_events_with_limit(lilypalooza_plugin_scan::PLUGIN_SCAN_UI_EVENT_BUDGET)
+        {
             match event {
                 lilypalooza_plugin_scan::PluginScanEvent::Log(line) => self.logger.push(line),
                 lilypalooza_plugin_scan::PluginScanEvent::ClapPlugins(plugins) => {
                     lilypalooza_clap::register_plugins(plugins);
                 }
+                lilypalooza_plugin_scan::PluginScanEvent::Vst3Plugins(plugins) => {
+                    lilypalooza_vst3::register_plugins(plugins);
+                }
                 lilypalooza_plugin_scan::PluginScanEvent::Finished { summary, cache } => {
                     let _ = summary;
-                    self.plugin_scan_cache = cache;
-                    if let Err(error) = self.plugin_scan_cache.save_to(&plugin_scan_cache_path()) {
-                        self.logger.push(error);
-                    }
+                    self.plugin_scan_cache = cache.clone();
+                    tasks.push(Task::perform(
+                        save_plugin_scan_cache(cache, plugin_scan_cache_path()),
+                        Message::PluginScanCacheSaved,
+                    ));
                 }
             }
         }
+        Task::batch(tasks)
     }
 
     pub(in crate::app) fn handle_startup_checked(
@@ -217,7 +233,7 @@ impl Lilypalooza {
 
         self.poll_editor_file_watcher(&mut tasks);
         self.poll_browser_file_watcher(&mut tasks);
-        self.poll_plugin_scan();
+        tasks.push(self.poll_plugin_scan());
 
         if self.editor_tick_active()
             && let Some(tab_id) = self.editor.active_tab_id()
@@ -260,11 +276,15 @@ impl Lilypalooza {
         if self.playback.is_some() {
             self.refresh_playback_position();
         }
-        for error in self
-            .processor_editor_windows
-            .apply_requested_content_resizes()
-        {
-            self.log_processor_editor_error("resize", error);
+        let mut resize_errors: Option<Vec<String>> = None;
+        self.processor_editor_windows
+            .apply_requested_content_resizes(|error| {
+                resize_errors.get_or_insert_with(Vec::new).push(error);
+            });
+        if let Some(resize_errors) = resize_errors {
+            for error in resize_errors {
+                self.log_processor_editor_error("resize", error);
+            }
         }
         for (target, command) in self.processor_editor_windows.drain_frame_commands() {
             self.handle_processor_editor_frame_command(target, command);

@@ -62,6 +62,12 @@ pub(super) fn update(app: &mut Lilypalooza, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::PluginScanCacheSaved(result) => {
+            if let Err(error) = result {
+                app.logger.push(error);
+            }
+            Task::none()
+        }
         Message::Pane(message) => app.handle_pane_message(message),
         Message::File(message) => app.handle_file_message(message),
         Message::Viewer(message) => app.handle_viewer_message(message),
@@ -98,6 +104,7 @@ fn should_commit_track_rename_before_message(message: &Message) -> bool {
         Message::Noop
             | Message::StartupChecked(_)
             | Message::BrowserHistoryCleanupFinished(_)
+            | Message::PluginScanCacheSaved(_)
             | Message::ScorePreviewReady(_)
             | Message::CompileOutputsReady(_)
             | Message::Pane(_)

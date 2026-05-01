@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 lilypalooza-clap = { path = "../lilypalooza-clap" }
+lilypalooza-vst3 = { path = "../lilypalooza-vst3" }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [lints]

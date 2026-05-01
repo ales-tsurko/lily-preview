@@ -87,8 +87,9 @@ where
         }),
     };
     let window_pending_resize = Arc::clone(&pending_resize);
+    let initial_size = Size::new(options.width, options.height);
     let window = Window::open_parented(&parent, open_options, move |window| {
-        EguiWindow::new(window, build(), window_pending_resize)
+        EguiWindow::new(window, build(), window_pending_resize, initial_size)
     });
     Ok(EguiWindowHandle {
         window,
@@ -165,7 +166,12 @@ struct EguiWindow<App> {
 }
 
 impl<App: EguiApp> EguiWindow<App> {
-    fn new(window: &mut Window<'_>, app: App, pending_resize: Arc<Mutex<Option<Size>>>) -> Self {
+    fn new(
+        window: &mut Window<'_>,
+        app: App,
+        pending_resize: Arc<Mutex<Option<Size>>>,
+        initial_size: Size,
+    ) -> Self {
         let Some(context) = window.gl_context() else {
             panic!("baseview did not create an OpenGL context");
         };
@@ -188,16 +194,18 @@ impl<App: EguiApp> EguiWindow<App> {
         unsafe {
             context.make_not_current();
         }
-        Self {
+        let mut window = Self {
             app,
             ctx: egui::Context::default(),
             painter,
             gl,
             input: RawInput::default(),
-            window_info: WindowInfo::from_logical_size(Size::new(1.0, 1.0), 1.0),
+            window_info: initial_window_info(initial_size),
             pointer_pos: None,
             pending_resize,
-        }
+        };
+        window.set_window_info(initial_window_info(initial_size));
+        window
     }
 
     fn set_window_info(&mut self, window_info: WindowInfo) {
@@ -255,6 +263,10 @@ impl<App: EguiApp> EguiWindow<App> {
 
 fn clear_color() -> [f32; 4] {
     [0.0, 0.0, 0.0, 0.0]
+}
+
+fn initial_window_info(size: Size) -> WindowInfo {
+    WindowInfo::from_logical_size(size, 1.0)
 }
 
 impl<App> Drop for EguiWindow<App> {
@@ -461,5 +473,14 @@ mod tests {
     #[test]
     fn clears_parented_egui_view_to_transparent() {
         assert_eq!(super::clear_color(), [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn initializes_parented_egui_view_to_requested_size() {
+        let info = super::initial_window_info(super::Size::new(640.0, 514.0));
+
+        assert_eq!(info.logical_size(), super::Size::new(640.0, 514.0));
+        assert_eq!(info.physical_size().width, 640);
+        assert_eq!(info.physical_size().height, 514);
     }
 }

@@ -145,6 +145,10 @@ pub fn content_size_from_outer_size(
     }
 }
 
+fn same_size(a: Size, b: Size) -> bool {
+    (a.width - b.width).abs() < 0.5 && (a.height - b.height).abs() < 0.5
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Size {
     pub width: f64,
@@ -252,6 +256,11 @@ impl InstalledHost {
     }
 
     #[must_use]
+    pub fn content_size(&self) -> Size {
+        self.content_size
+    }
+
+    #[must_use]
     pub fn close_requested(&self) -> bool {
         self.close_requested.load(Ordering::Relaxed)
     }
@@ -272,15 +281,48 @@ impl InstalledHost {
                 self.titlebar_height(),
                 self.frame_thickness,
                 self.frame_window.as_mut(),
+                ResizeAnchor::Bottom,
             );
         }
     }
 
     pub fn resize_content(&mut self, content_size: Size) -> Result<(), Error> {
-        self.set_content_size(content_size);
-        if self.frame_window.is_none() {
+        self.resize_content_with_anchor(content_size, ResizeAnchor::Bottom)
+    }
+
+    pub fn resize_content_from_top(&mut self, content_size: Size) -> Result<(), Error> {
+        self.resize_content_with_anchor(content_size, ResizeAnchor::Top)
+    }
+
+    fn resize_content_with_anchor(
+        &mut self,
+        content_size: Size,
+        anchor: ResizeAnchor,
+    ) -> Result<(), Error> {
+        if same_size(self.content_size, content_size) {
+            trace_editor_host(|| {
+                format!(
+                    "installed-host resize_content ignored same size current={:?} requested={:?} anchor={anchor:?}",
+                    self.content_size, content_size
+                )
+            });
             return Ok(());
         }
+        let previous = self.content_size;
+        self.set_content_size(content_size);
+        if self.frame_window.is_none() {
+            trace_editor_host(|| {
+                format!(
+                    "installed-host resize_content stored without frame current={previous:?} requested={content_size:?} anchor={anchor:?}"
+                )
+            });
+            return Ok(());
+        }
+        trace_editor_host(|| {
+            format!(
+                "installed-host resize_content applying current={previous:?} requested={content_size:?} anchor={anchor:?}"
+            )
+        });
         resize_installed_host(
             &self.host,
             &self.content,
@@ -288,6 +330,7 @@ impl InstalledHost {
             self.titlebar_height(),
             self.frame_thickness,
             self.frame_window.as_mut(),
+            anchor,
         )
     }
 
@@ -346,6 +389,18 @@ impl InstalledHost {
 
     pub fn raise(&mut self) -> Result<(), Error> {
         raise_host_window(&self.host)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeAnchor {
+    Top,
+    Bottom,
+}
+
+fn trace_editor_host(message: impl FnOnce() -> String) {
+    if std::env::var_os("LILYPALOOZA_EDITOR_HOST_TRACE").is_some() {
+        eprintln!("[editor-host] {}", message());
     }
 }
 
@@ -702,6 +757,7 @@ fn resize_installed_host(
     titlebar_height: f64,
     frame_thickness: f64,
     frame_window: Option<&mut EguiWindowHandle>,
+    anchor: ResizeAnchor,
 ) -> Result<(), Error> {
     let layout = host_layout(
         content_size.width,
@@ -715,8 +771,15 @@ fn resize_installed_host(
         content_size,
         titlebar_height,
         frame_thickness,
+        anchor,
     )?;
     if let Some(frame_window) = frame_window {
+        trace_editor_host(|| {
+            format!(
+                "egui frame resize outer={}x{} content={content_size:?}",
+                layout.outer_width, layout.outer_height
+            )
+        });
         frame_window.resize(layout.outer_width, layout.outer_height);
     }
     Ok(())
@@ -730,6 +793,7 @@ fn resize_installed_host(
     titlebar_height: f64,
     frame_thickness: f64,
     frame_window: Option<&mut EguiWindowHandle>,
+    _anchor: ResizeAnchor,
 ) -> Result<(), Error> {
     let layout = host_layout(
         content_size.width,
@@ -917,6 +981,28 @@ mod tests {
             Size {
                 width: 512.0,
                 height: 384.0,
+            }
+        );
+    }
+
+    #[test]
+    fn installed_host_ignores_same_content_size_resize() {
+        let (mut host, _) = super::InstalledHost::test_with_frame_commands([]);
+
+        host.resize_content(Size {
+            width: 440.25,
+            height: 359.75,
+        })
+        .expect("same size resize should be a no-op");
+
+        assert_eq!(
+            *host
+                .frame_content_size
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Size {
+                width: 440.0,
+                height: 360.0,
             }
         );
     }

@@ -248,7 +248,9 @@ impl editor_host::EditorFrame for AppEditorFrame {
         ui: &mut editor_host::egui::Ui,
         state: &editor_host::EditorHostState,
     ) -> editor_host::EditorFrameAction {
-        let rect = self.frame_rect(ui.max_rect(), state);
+        let live_rect = ui.max_rect();
+        let expected_rect = self.frame_rect(live_rect, state);
+        let rect = self.paint_rect(live_rect, expected_rect);
         ui.painter().rect_filled(rect, 0.0, self.style.frame_color);
         ui.painter().rect_stroke(
             rect.shrink(self.border_width / 2.0),
@@ -414,6 +416,14 @@ impl AppEditorFrame {
             available.left_top(),
             editor_host::egui::vec2(layout.outer_width as f32, layout.outer_height as f32),
         )
+    }
+
+    fn paint_rect(
+        &self,
+        available: editor_host::egui::Rect,
+        _expected: editor_host::egui::Rect,
+    ) -> editor_host::egui::Rect {
+        available
     }
 
     fn preset_menu_icon(expanded: bool) -> AppEditorFrameIcon {
@@ -2537,6 +2547,21 @@ mod tests {
         );
         assert!(rect.width() < live_rect.width());
         assert!(rect.height() < live_rect.height());
+    }
+
+    #[test]
+    fn app_editor_frame_paints_full_live_window_to_avoid_black_gaps() {
+        let frame = AppEditorFrame::from_theme(&iced::Theme::Dark);
+        let live_rect = editor_host::egui::Rect::from_min_size(
+            editor_host::egui::pos2(0.0, 0.0),
+            editor_host::egui::vec2(900.0, 700.0),
+        );
+        let expected_rect = editor_host::egui::Rect::from_min_size(
+            editor_host::egui::pos2(0.0, 0.0),
+            editor_host::egui::vec2(644.0, 518.0),
+        );
+
+        assert_eq!(frame.paint_rect(live_rect, expected_rect), live_rect);
     }
 
     #[test]

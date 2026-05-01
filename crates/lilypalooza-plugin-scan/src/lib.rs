@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum number of concurrent validator subprocesses.
 pub const PLUGIN_VALIDATOR_CONCURRENCY: usize = 1;
+/// Maximum scanner events the app should process in one UI update.
+pub const PLUGIN_SCAN_UI_EVENT_BUDGET: usize = 16;
 
 /// Plugin binary format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +55,8 @@ pub enum PluginScanEvent {
     Log(String),
     /// Validated CLAP plugin metadata.
     ClapPlugins(Vec<lilypalooza_clap::ClapPluginMetadata>),
+    /// Validated VST3 plugin metadata.
+    Vst3Plugins(Vec<lilypalooza_vst3::Vst3PluginMetadata>),
     /// Scan completion.
     Finished {
         /// Scan summary.
@@ -102,15 +106,35 @@ impl PluginScanState {
 
     /// Drains pending scan events.
     pub fn drain_events(&mut self) -> Vec<PluginScanEvent> {
+        self.drain_events_with_limit(usize::MAX)
+    }
+
+    /// Drains up to `limit` pending scan events.
+    pub fn drain_events_with_limit(&mut self, limit: usize) -> Vec<PluginScanEvent> {
         let mut events = Vec::new();
+        if limit == 0 {
+            return events;
+        }
         let Some(receiver) = &self.receiver else {
             return events;
         };
-        while let Ok(event) = receiver.try_recv() {
-            if matches!(event, PluginScanEvent::Finished { .. }) {
-                self.active = false;
+        for _ in 0..limit {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    if matches!(event, PluginScanEvent::Finished { .. }) {
+                        self.active = false;
+                    }
+                    events.push(event);
+                    if !self.active {
+                        break;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.active = false;
+                    break;
+                }
             }
-            events.push(event);
         }
         if !self.active {
             self.receiver = None;
@@ -129,7 +153,10 @@ pub struct PluginScanCache {
 struct CachedPluginCandidate {
     fingerprint: PluginCandidateFingerprint,
     valid: bool,
+    #[serde(default)]
     clap_plugins: Vec<lilypalooza_clap::ClapPluginMetadata>,
+    #[serde(default)]
+    vst3_plugins: Vec<lilypalooza_vst3::Vst3PluginMetadata>,
 }
 
 impl PluginScanCache {
@@ -178,6 +205,7 @@ impl PluginScanCache {
         fingerprint: PluginCandidateFingerprint,
         valid: bool,
         clap_plugins: Vec<lilypalooza_clap::ClapPluginMetadata>,
+        vst3_plugins: Vec<lilypalooza_vst3::Vst3PluginMetadata>,
     ) {
         self.entries.insert(
             path,
@@ -185,6 +213,7 @@ impl PluginScanCache {
                 fingerprint,
                 valid,
                 clap_plugins,
+                vst3_plugins,
             },
         );
     }
@@ -198,6 +227,8 @@ impl PluginScanCache {
             (entry.fingerprint == fingerprint).then(|| {
                 if entry.valid && !entry.clap_plugins.is_empty() {
                     CachedCandidateResult::ValidClapPlugins(entry.clap_plugins.clone())
+                } else if entry.valid && !entry.vst3_plugins.is_empty() {
+                    CachedCandidateResult::ValidVst3Plugins(entry.vst3_plugins.clone())
                 } else {
                     CachedCandidateResult::Invalid
                 }
@@ -208,6 +239,7 @@ impl PluginScanCache {
 
 enum CachedCandidateResult {
     ValidClapPlugins(Vec<lilypalooza_clap::ClapPluginMetadata>),
+    ValidVst3Plugins(Vec<lilypalooza_vst3::Vst3PluginMetadata>),
     Invalid,
 }
 
@@ -277,6 +309,10 @@ fn scan_worker(
                         summary.valid_plugins += plugins.len();
                         let _ = sender.send(PluginScanEvent::ClapPlugins(plugins));
                     }
+                    Some(CachedCandidateResult::ValidVst3Plugins(plugins)) => {
+                        summary.valid_plugins += plugins.len();
+                        let _ = sender.send(PluginScanEvent::Vst3Plugins(plugins));
+                    }
                     Some(CachedCandidateResult::Invalid) | None => {
                         summary.invalid_candidates += 1;
                     }
@@ -287,7 +323,13 @@ fn scan_worker(
                 Ok(ValidatedPlugins::Clap(plugins)) => {
                     if plugins.is_empty() {
                         summary.invalid_candidates += 1;
-                        cache.mark_checked(candidate.clone(), fingerprint, false, Vec::new());
+                        cache.mark_checked(
+                            candidate.clone(),
+                            fingerprint,
+                            false,
+                            Vec::new(),
+                            Vec::new(),
+                        );
                         let _ = sender.send(PluginScanEvent::Log(format!(
                             "No CLAP plugins found in {}",
                             candidate.display()
@@ -295,7 +337,13 @@ fn scan_worker(
                         continue;
                     }
                     summary.valid_plugins += plugins.len();
-                    cache.mark_checked(candidate.clone(), fingerprint, true, plugins.clone());
+                    cache.mark_checked(
+                        candidate.clone(),
+                        fingerprint,
+                        true,
+                        plugins.clone(),
+                        Vec::new(),
+                    );
                     let _ = sender.send(PluginScanEvent::Log(format!(
                         "Validated {} CLAP plugin(s) from {}",
                         plugins.len(),
@@ -303,9 +351,46 @@ fn scan_worker(
                     )));
                     let _ = sender.send(PluginScanEvent::ClapPlugins(plugins));
                 }
+                Ok(ValidatedPlugins::Vst3(plugins)) => {
+                    if plugins.is_empty() {
+                        summary.invalid_candidates += 1;
+                        cache.mark_checked(
+                            candidate.clone(),
+                            fingerprint,
+                            false,
+                            Vec::new(),
+                            Vec::new(),
+                        );
+                        let _ = sender.send(PluginScanEvent::Log(format!(
+                            "No VST3 plugins found in {}",
+                            candidate.display()
+                        )));
+                        continue;
+                    }
+                    summary.valid_plugins += plugins.len();
+                    cache.mark_checked(
+                        candidate.clone(),
+                        fingerprint,
+                        true,
+                        Vec::new(),
+                        plugins.clone(),
+                    );
+                    let _ = sender.send(PluginScanEvent::Log(format!(
+                        "Validated {} VST3 plugin(s) from {}",
+                        plugins.len(),
+                        candidate.display()
+                    )));
+                    let _ = sender.send(PluginScanEvent::Vst3Plugins(plugins));
+                }
                 Err(error) => {
                     summary.invalid_candidates += 1;
-                    cache.mark_checked(candidate.clone(), fingerprint, false, Vec::new());
+                    cache.mark_checked(
+                        candidate.clone(),
+                        fingerprint,
+                        false,
+                        Vec::new(),
+                        Vec::new(),
+                    );
                     let _ = sender.send(PluginScanEvent::Log(format!(
                         "Invalid plugin {}: {error}",
                         candidate.display()
@@ -328,12 +413,15 @@ pub fn candidates_for_root(root: &PluginSearchPath) -> Result<Vec<PathBuf>, Stri
         PluginFormat::Clap => {
             lilypalooza_clap::candidate_paths(&root.path).map_err(|error| error.to_string())
         }
-        PluginFormat::Vst3 => Ok(Vec::new()),
+        PluginFormat::Vst3 => {
+            lilypalooza_vst3::candidate_paths(&root.path).map_err(|error| error.to_string())
+        }
     }
 }
 
 enum ValidatedPlugins {
     Clap(Vec<lilypalooza_clap::ClapPluginMetadata>),
+    Vst3(Vec<lilypalooza_vst3::Vst3PluginMetadata>),
 }
 
 fn validate_candidate(
@@ -343,8 +431,28 @@ fn validate_candidate(
 ) -> Result<ValidatedPlugins, String> {
     match format {
         PluginFormat::Clap => validate_clap_candidate(path, validator),
-        PluginFormat::Vst3 => Err("VST3 adapter is not implemented yet".to_string()),
+        PluginFormat::Vst3 => validate_vst3_candidate(path, validator),
     }
+}
+
+fn validate_vst3_candidate(path: &Path, validator: &Path) -> Result<ValidatedPlugins, String> {
+    let output = Command::new(validator)
+        .arg("--format")
+        .arg(lilypalooza_vst3::FORMAT)
+        .arg("--path")
+        .arg(path)
+        .output()
+        .map_err(|error| format!("failed to run validator {}: {error}", validator.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(stderr.trim().to_string());
+    }
+    let report: lilypalooza_vst3::ValidationReport =
+        serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())?;
+    report
+        .result
+        .map(ValidatedPlugins::Vst3)
+        .map_err(|error| error.to_string())
 }
 
 fn validate_clap_candidate(path: &Path, validator: &Path) -> Result<ValidatedPlugins, String> {
@@ -386,7 +494,7 @@ mod tests {
         };
 
         assert!(cache.is_stale(&path, old));
-        cache.mark_checked(path.clone(), old, true, Vec::new());
+        cache.mark_checked(path.clone(), old, true, Vec::new(), Vec::new());
         assert!(!cache.is_stale(&path, old));
         assert!(cache.is_stale(&path, new));
     }
@@ -408,6 +516,23 @@ mod tests {
     }
 
     #[test]
+    fn vst3_root_collects_vst3_candidates_recursively() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("a.clap"), "").expect("clap file");
+        let nested = dir.path().join("Vendor").join("b.vst3");
+        std::fs::create_dir_all(&nested).expect("vst3 bundle");
+        let root = PluginSearchPath {
+            format: PluginFormat::Vst3,
+            path: dir.path().to_path_buf(),
+            enabled: true,
+        };
+
+        let candidates = candidates_for_root(&root).expect("scan root");
+
+        assert_eq!(candidates, vec![nested]);
+    }
+
+    #[test]
     fn cache_roundtrips_from_explicit_path() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("plugin-cache.ron");
@@ -417,12 +542,51 @@ mod tests {
             len: 9,
         };
         let mut cache = PluginScanCache::default();
-        cache.mark_checked(candidate.clone(), fingerprint, true, Vec::new());
+        cache.mark_checked(candidate.clone(), fingerprint, true, Vec::new(), Vec::new());
 
         cache.save_to(&path).expect("cache should save");
         let loaded = PluginScanCache::load_from(&path);
 
         assert!(!loaded.is_stale(&candidate, fingerprint));
+    }
+
+    #[test]
+    fn drain_events_with_limit_keeps_scan_active_when_budget_is_exhausted() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PluginScanEvent::Log("one".to_string()))
+            .expect("send one");
+        sender
+            .send(PluginScanEvent::Log("two".to_string()))
+            .expect("send two");
+        sender
+            .send(PluginScanEvent::Log("three".to_string()))
+            .expect("send three");
+        let mut state = PluginScanState {
+            receiver: Some(receiver),
+            active: true,
+        };
+
+        let events = state.drain_events_with_limit(2);
+
+        assert_eq!(events.len(), 2);
+        assert!(state.is_active());
+        assert_eq!(state.drain_events().len(), 1);
+    }
+
+    #[test]
+    fn drain_events_with_limit_zero_does_not_drain() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PluginScanEvent::Log("one".to_string()))
+            .expect("send one");
+        let mut state = PluginScanState {
+            receiver: Some(receiver),
+            active: true,
+        };
+
+        assert!(state.drain_events_with_limit(0).is_empty());
+        assert_eq!(state.drain_events().len(), 1);
     }
 
     #[test]
@@ -464,7 +628,7 @@ mod tests {
                 match event {
                     PluginScanEvent::Log(log) => logs.push(log),
                     PluginScanEvent::Finished { summary, .. } => return (summary, logs),
-                    PluginScanEvent::ClapPlugins(_) => {}
+                    PluginScanEvent::ClapPlugins(_) | PluginScanEvent::Vst3Plugins(_) => {}
                 }
             }
             std::thread::sleep(Duration::from_millis(10));

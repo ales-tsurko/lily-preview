@@ -3,6 +3,16 @@
 use std::io;
 use std::path::PathBuf;
 
+/// Structured validation report for any supported plugin format.
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum ValidationReport {
+    /// CLAP validation report.
+    Clap(lilypalooza_clap::ValidationReport),
+    /// VST3 validation report.
+    Vst3(lilypalooza_vst3::ValidationReport),
+}
+
 /// Runs validator CLI logic, writes CLI output, and returns a process exit code.
 pub fn run_cli(args: Vec<String>) -> i32 {
     match run(args) {
@@ -21,7 +31,7 @@ pub fn run_cli(args: Vec<String>) -> i32 {
 }
 
 /// Runs validator CLI logic and returns a structured report.
-pub fn run(args: Vec<String>) -> Result<lilypalooza_clap::ValidationReport, String> {
+pub fn run(args: Vec<String>) -> Result<ValidationReport, String> {
     let mut format = None;
     let mut path = None;
     let mut iter = args.into_iter();
@@ -39,18 +49,26 @@ pub fn run(args: Vec<String>) -> Result<lilypalooza_clap::ValidationReport, Stri
     match format.as_str() {
         lilypalooza_clap::FORMAT => {
             let result = lilypalooza_clap::probe(&path).map_err(|error| error.to_string());
-            Ok(lilypalooza_clap::ValidationReport {
+            Ok(ValidationReport::Clap(lilypalooza_clap::ValidationReport {
                 format,
                 path,
                 result,
-            })
+            }))
+        }
+        lilypalooza_vst3::FORMAT => {
+            let result = lilypalooza_vst3::probe(&path).map_err(|error| error.to_string());
+            Ok(ValidationReport::Vst3(lilypalooza_vst3::ValidationReport {
+                format,
+                path,
+                result,
+            }))
         }
         _ => Err(format!("unsupported plugin format: {format}")),
     }
 }
 
 fn usage() -> String {
-    "usage: lilypalooza-plugin-validator --format clap --path <plugin>".to_string()
+    "usage: lilypalooza-plugin-validator --format clap|vst3 --path <plugin>".to_string()
 }
 
 #[cfg(test)]

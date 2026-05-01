@@ -16,6 +16,7 @@ pub(super) enum Message {
     Noop,
     StartupChecked(Result<crate::lilypond::VersionCheck, String>),
     BrowserHistoryCleanupFinished(Result<(), String>),
+    PluginScanCacheSaved(Result<(), String>),
     Pane(PaneMessage),
     File(FileMessage),
     Viewer(ViewerMessage),

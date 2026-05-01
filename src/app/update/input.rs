@@ -901,9 +901,6 @@ impl Lilypalooza {
         size: Size,
     ) -> Task<Message> {
         if window_id != self.main_window_id {
-            for error in self.processor_editor_windows.resize_window(window_id, size) {
-                self.log_processor_editor_error("resize", error);
-            }
             return Task::none();
         }
 

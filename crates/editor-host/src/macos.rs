@@ -13,8 +13,8 @@ use objc2_quartz_core::CALayer;
 use raw_window_handle::RawWindowHandle;
 
 use crate::{
-    EditorFrame, EditorHostOptions, Error, InstalledHost, Size, WindowHandleSnapshot,
-    WindowSnapshot, host_layout, open_egui_frame,
+    EditorFrame, EditorHostOptions, Error, InstalledHost, ResizeAnchor, Size, WindowHandleSnapshot,
+    WindowSnapshot, host_layout, open_egui_frame, trace_editor_host,
 };
 
 pub fn prepare_process() -> Result<(), Error> {
@@ -52,6 +52,15 @@ pub fn install_editor_host(
     let layout = frame.layout(Size {
         width: requested_bounds.size.width,
         height: requested_bounds.size.height,
+    });
+    trace_editor_host(|| {
+        format!(
+            "install requested_bounds={} layout_outer={}x{} content={:?}",
+            format_rect(requested_bounds),
+            layout.outer_width,
+            layout.outer_height,
+            layout.content
+        )
     });
 
     resize_host_window_from_top_clamped_to_screen(
@@ -114,6 +123,7 @@ pub fn resize_installed_host(
     content_size: Size,
     titlebar_height: f64,
     frame_thickness: f64,
+    anchor: ResizeAnchor,
 ) -> Result<(), Error> {
     let layout = host_layout(
         content_size.width,
@@ -125,18 +135,32 @@ pub fn resize_installed_host(
     let host_window = host_view
         .window()
         .ok_or_else(|| Error::Message("host window is missing".to_string()))?;
-    resize_host_window_from_bottom_clamped_to_screen(
+    let before_window_frame = host_window.frame();
+    let before_host_frame = host_view.frame();
+    let before_host_bounds = host_view.bounds();
+    resize_host_window_clamped_to_screen(
         &host_window,
         layout.outer_width,
         layout.outer_height,
+        anchor,
     );
     host_view.setFrameSize(NSSize::new(layout.outer_width, layout.outer_height));
 
     let content_view = ns_view_from_snapshot(content)?;
-    content_view.setFrame(ns_rect(content_frame_for_host(
-        layout,
-        host_view.isFlipped(),
-    )));
+    let content_frame = ns_rect(content_frame_for_host(layout, host_view.isFlipped()));
+    content_view.setFrame(content_frame);
+    trace_editor_host(|| {
+        format!(
+            "macos resize_installed_host anchor={anchor:?} content={content_size:?} window {} -> {} host_frame {} -> {} host_bounds {} -> {} content_frame={}",
+            format_rect(before_window_frame),
+            format_rect(host_window.frame()),
+            format_rect(before_host_frame),
+            format_rect(host_view.frame()),
+            format_rect(before_host_bounds),
+            format_rect(host_view.bounds()),
+            format_rect(content_frame)
+        )
+    });
     Ok(())
 }
 
@@ -311,6 +335,20 @@ fn resize_host_window_from_bottom_clamped_to_screen(window: &NSWindow, width: f6
     window.setFrame_display(frame, false);
 }
 
+fn resize_host_window_clamped_to_screen(
+    window: &NSWindow,
+    width: f64,
+    height: f64,
+    anchor: ResizeAnchor,
+) {
+    match anchor {
+        ResizeAnchor::Top => resize_host_window_from_top_clamped_to_screen(window, width, height),
+        ResizeAnchor::Bottom => {
+            resize_host_window_from_bottom_clamped_to_screen(window, width, height);
+        }
+    }
+}
+
 fn host_window_frame_resized_from_top(mut frame: NSRect, width: f64, height: f64) -> NSRect {
     let delta_height = height - frame.size.height;
     frame.origin.y -= delta_height;
@@ -408,6 +446,13 @@ fn ns_rect(frame: crate::Rect) -> NSRect {
     NSRect::new(
         NSPoint::new(frame.x, frame.y),
         NSSize::new(frame.width, frame.height),
+    )
+}
+
+fn format_rect(rect: NSRect) -> String {
+    format!(
+        "x={:.1} y={:.1} w={:.1} h={:.1}",
+        rect.origin.x, rect.origin.y, rect.size.width, rect.size.height
     )
 }
 
