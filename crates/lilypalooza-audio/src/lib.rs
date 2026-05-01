@@ -25,7 +25,7 @@ pub use instrument::{
     ControllerError, EditorDescriptor, EditorError, EditorParent, EditorSession, EditorSize,
     EffectProcessor, EffectRuntimeHandle, InstrumentProcessor, InstrumentRuntimeHandle, MidiEvent,
     ParameterDescriptor, Processor, ProcessorDescriptor, ProcessorKind, ProcessorState,
-    ProcessorStateError, SlotState,
+    ProcessorStateError, SharedAudioValue, SlotState, SmoothedAudioValue,
 };
 pub use mixer::{
     BusId, BusSend, INSTRUMENT_TRACK_COUNT, SlotAddress, Track, TrackId, TrackRoute, TrackRouting,

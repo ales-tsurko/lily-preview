@@ -911,7 +911,21 @@ impl MixerHandle<'_> {
         index: usize,
         send: BusSend,
     ) -> Result<(), AudioEngineError> {
+        let track = self.mixer.state.track(id)?;
+        let old_send =
+            *track
+                .routing
+                .sends
+                .get(index)
+                .ok_or(MixerError::BusSendIndexOutOfBounds {
+                    index,
+                    len: track.routing.sends.len(),
+                })?;
         self.mixer.state.set_track_bus_send(id, index, send)?;
+        if send_level_only_changed(old_send, send) {
+            self.mixer.runtime.sync_all_send_levels(&self.mixer.state);
+            return Ok(());
+        }
         self.mixer
             .runtime
             .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
@@ -1009,7 +1023,20 @@ impl MixerHandle<'_> {
         index: usize,
         send: BusSend,
     ) -> Result<(), AudioEngineError> {
+        let bus = self.mixer.state.bus(id)?;
+        let old_send =
+            *bus.routing
+                .sends
+                .get(index)
+                .ok_or(MixerError::BusSendIndexOutOfBounds {
+                    index,
+                    len: bus.routing.sends.len(),
+                })?;
         self.mixer.state.set_bus_send(id, index, send)?;
+        if send_level_only_changed(old_send, send) {
+            self.mixer.runtime.sync_all_send_levels(&self.mixer.state);
+            return Ok(());
+        }
         self.mixer
             .runtime
             .sync_all_routing(self.context, self.commands, &self.mixer.state)?;
@@ -1077,72 +1104,9 @@ impl MixerHandle<'_> {
             .into());
         }
         self.mixer.state.slot_mut(address)?.bypassed = bypassed;
-        match address.strip_index {
-            0 => {
-                self.mixer.runtime.sync_master_effects(
-                    self.context,
-                    self.commands,
-                    &self.mixer.state,
-                )?;
-                self.mixer.runtime.sync_all_routing(
-                    self.context,
-                    self.commands,
-                    &self.mixer.state,
-                )?;
-            }
-            strip_index if strip_index <= self.mixer.state.track_count() => {
-                let track_id = TrackId((strip_index - 1) as u16);
-                let graph_changed = self.mixer.runtime.sync_track_effects(
-                    self.context,
-                    self.commands,
-                    &self.mixer.state,
-                    track_id,
-                )?;
-                self.mixer.runtime.sync_all_routing(
-                    self.context,
-                    self.commands,
-                    &self.mixer.state,
-                )?;
-                if graph_changed {
-                    self.sequencer.sync_track_handle(
-                        self.commands,
-                        track_id,
-                        self.mixer.instrument_handle(track_id),
-                    );
-                    if self.sequencer.is_playing() {
-                        let current_beat =
-                            current_playing_beat(self.commands).unwrap_or(Beats::ZERO);
-                        self.sequencer.mark_dirty_for_seek(current_beat, true);
-                    }
-                }
-            }
-            _ => {
-                let Some(bus_id) = self
-                    .mixer
-                    .state
-                    .strip_by_index(address.strip_index)
-                    .and_then(|strip| strip.bus_id)
-                else {
-                    return Err(MixerError::InvalidSlotAddress {
-                        strip_index: address.strip_index,
-                        slot_index: address.slot_index,
-                    }
-                    .into());
-                };
-                self.mixer.runtime.sync_bus_effects(
-                    self.context,
-                    self.commands,
-                    &self.mixer.state,
-                    bus_id,
-                )?;
-                self.mixer.runtime.sync_all_routing(
-                    self.context,
-                    self.commands,
-                    &self.mixer.state,
-                )?;
-            }
-        }
-        settle_graph_mutation(self.commands);
+        self.mixer
+            .runtime
+            .sync_slot_bypass(&self.mixer.state, address)?;
         Ok(())
     }
 }
@@ -1154,6 +1118,12 @@ fn settle_graph_mutation(commands: &mut MultiThreadedKnystCommands) {
         return;
     };
     let _ = receiver.recv_timeout(GRAPH_SETTLE_TIMEOUT);
+}
+
+fn send_level_only_changed(old: BusSend, new: BusSend) -> bool {
+    old.bus_id == new.bus_id
+        && old.pre_fader == new.pre_fader
+        && (old.enabled != new.enabled || old.gain_db.to_bits() != new.gain_db.to_bits())
 }
 
 fn current_playing_beat(commands: &mut MultiThreadedKnystCommands) -> Option<Beats> {
@@ -1171,7 +1141,7 @@ fn current_playing_beat(commands: &mut MultiThreadedKnystCommands) -> Option<Bea
 
 #[cfg(test)]
 mod tests {
-    use super::{MixerError, MixerState};
+    use super::{MixerError, MixerState, send_level_only_changed};
     use crate::instrument::{
         BUILTIN_GAIN_ID, BUILTIN_SOUNDFONT_ID, ProcessorKind, ProcessorState, SlotState,
     };
@@ -1181,6 +1151,30 @@ mod tests {
 
     fn soundfont_slot(program: u8) -> SlotState {
         SlotState::built_in(BUILTIN_SOUNDFONT_ID, ProcessorState(vec![program]))
+    }
+
+    #[test]
+    fn send_level_change_is_detected_without_routing_rebuild() {
+        let bus_id = BusId(1);
+
+        assert!(send_level_only_changed(
+            BusSend::new(bus_id, -6.0, false),
+            BusSend::new(bus_id, -3.0, false)
+        ));
+        let mut disabled = BusSend::new(bus_id, -6.0, false);
+        disabled.enabled = false;
+        assert!(send_level_only_changed(
+            BusSend::new(bus_id, -6.0, false),
+            disabled
+        ));
+        assert!(!send_level_only_changed(
+            BusSend::new(bus_id, -6.0, false),
+            BusSend::new(BusId(2), -3.0, false)
+        ));
+        assert!(!send_level_only_changed(
+            BusSend::new(bus_id, -6.0, false),
+            BusSend::new(bus_id, -3.0, true)
+        ));
     }
 
     #[test]

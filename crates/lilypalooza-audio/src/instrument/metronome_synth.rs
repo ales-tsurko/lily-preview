@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::instrument::{
     InstrumentProcessor, MidiEvent, ParameterDescriptor, Processor, ProcessorDescriptor,
-    ProcessorState, ProcessorStateError,
+    ProcessorState, ProcessorStateError, SmoothedAudioValue,
 };
 
 const MIN_GAIN_DB: f32 = -36.0;
@@ -83,10 +83,12 @@ pub(crate) struct MetronomeProcessor {
     noise_state: u32,
     noise_prev: f32,
     noise_hp: f32,
+    gain: SmoothedAudioValue,
 }
 
 impl MetronomeProcessor {
     pub(crate) fn new(sample_rate: f32, shared: SharedMetronomeState) -> Self {
+        let gain = knyst::db_to_amplitude(shared.gain_db());
         Self {
             shared,
             sample_rate: sample_rate.max(1.0),
@@ -99,6 +101,7 @@ impl MetronomeProcessor {
             noise_state: 0x1234_5678,
             noise_prev: 0.0,
             noise_hp: 0.0,
+            gain: SmoothedAudioValue::new(gain, sample_rate as usize),
         }
     }
 
@@ -178,7 +181,8 @@ impl InstrumentProcessor for MetronomeProcessor {
     }
 
     fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
-        let gain = knyst::db_to_amplitude(self.shared.gain_db());
+        self.gain
+            .set_target(knyst::db_to_amplitude(self.shared.gain_db()));
         let body_decay = (-1.0 / (self.sample_rate * 0.020)).exp();
         let noise_decay = (-1.0 / (self.sample_rate * 0.005)).exp();
         let hp_feedback = 0.88 - 0.10 * self.shared.pitch().clamp(0.0, 1.0);
@@ -200,6 +204,7 @@ impl InstrumentProcessor for MetronomeProcessor {
             self.noise_hp = noise - self.noise_prev + hp_feedback * self.noise_hp;
             self.noise_prev = noise;
             let transient = self.noise_hp * self.noise_env * self.transient_level;
+            let gain = self.gain.next_sample();
             let sample = (sine + transient) * gain;
             *left_sample = sample;
             *right_sample = sample;

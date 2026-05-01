@@ -8,6 +8,7 @@ use lilypalooza_audio::instrument::{
 use lilypalooza_audio::{
     BUILTIN_GAIN_ID, Controller, ControllerError, EffectProcessor, ParameterDescriptor, Processor,
     ProcessorDescriptor, ProcessorKind, ProcessorState, ProcessorStateError, SlotState,
+    SmoothedAudioValue,
 };
 
 pub(crate) const MIN_GAIN_DB: f32 = -60.0;
@@ -102,15 +103,16 @@ impl Controller for GainController {
 
 pub(crate) fn create_runtime(
     slot: &SlotState,
-    _context: &EffectRuntimeContext,
+    context: &EffectRuntimeContext,
 ) -> Result<Option<EffectRuntimeSpec>, RuntimeFactoryError> {
     if !is_slot(slot) {
         return Ok(None);
     }
     let shared = SharedGainState::default();
-    let processor = Box::new(GainEffectProcessor::from_state_with_shared(
+    let processor = Box::new(GainEffectProcessor::from_state_with_shared_and_sample_rate(
         &slot.state,
         Some(shared.clone()),
+        context.sample_rate,
     )?);
     Ok(Some(EffectRuntimeSpec {
         processor,
@@ -162,6 +164,8 @@ impl Default for GainEffectState {
 pub(crate) struct GainEffectProcessor {
     state: GainEffectState,
     shared: Option<SharedGainState>,
+    gain: SmoothedAudioValue,
+    sample_rate: usize,
 }
 
 impl GainEffectProcessor {
@@ -173,6 +177,14 @@ impl GainEffectProcessor {
         state: &ProcessorState,
         shared: Option<SharedGainState>,
     ) -> Result<Self, ProcessorStateError> {
+        Self::from_state_with_shared_and_sample_rate(state, shared, 44_100)
+    }
+
+    pub(crate) fn from_state_with_shared_and_sample_rate(
+        state: &ProcessorState,
+        shared: Option<SharedGainState>,
+        sample_rate: usize,
+    ) -> Result<Self, ProcessorStateError> {
         let state = if state.0.is_empty() {
             GainEffectState::default()
         } else {
@@ -182,7 +194,12 @@ impl GainEffectProcessor {
         if let Some(shared) = &shared {
             shared.set_gain_db(state.gain_db);
         }
-        Ok(Self { state, shared })
+        Ok(Self {
+            gain: SmoothedAudioValue::new(knyst::db_to_amplitude(state.gain_db), sample_rate),
+            sample_rate,
+            state,
+            shared,
+        })
     }
 }
 
@@ -221,7 +238,11 @@ impl Processor for GainEffectProcessor {
     }
 
     fn load_state(&mut self, state: &ProcessorState) -> Result<(), ProcessorStateError> {
-        *self = Self::from_state_with_shared(state, self.shared.clone())?;
+        *self = Self::from_state_with_shared_and_sample_rate(
+            state,
+            self.shared.clone(),
+            self.sample_rate,
+        )?;
         Ok(())
     }
 
@@ -236,12 +257,13 @@ impl EffectProcessor for GainEffectProcessor {
         out_left: &mut [f32],
         out_right: &mut [f32],
     ) {
-        let gain = knyst::db_to_amplitude(
+        self.gain.set_target(knyst::db_to_amplitude(
             self.shared
                 .as_ref()
                 .map_or(self.state.gain_db, SharedGainState::gain_db),
-        );
+        ));
         for frame in 0..out_left.len() {
+            let gain = self.gain.next_sample();
             out_left[frame] = in_left[frame] * gain;
             out_right[frame] = in_right[frame] * gain;
         }
@@ -257,7 +279,6 @@ mod tests {
     fn gain_effect_scales_expected_signal() {
         let mut processor =
             GainEffectProcessor::from_state(&ProcessorState::default()).expect("processor");
-        processor.set_param("gain_db", (-6.0 - MIN_GAIN_DB) / GAIN_RANGE_DB);
 
         let left_in = [0.0, 0.25, -0.5, 1.0];
         let right_in = [1.0, -0.5, 0.25, 0.0];
@@ -265,10 +286,27 @@ mod tests {
         let mut right_out = [0.0; 4];
         processor.process(&left_in, &right_in, &mut left_out, &mut right_out);
 
-        let gain = knyst::db_to_amplitude(-6.0);
         for index in 0..left_in.len() {
-            assert!((left_out[index] - left_in[index] * gain).abs() < 1.0e-6);
-            assert!((right_out[index] - right_in[index] * gain).abs() < 1.0e-6);
+            assert!((left_out[index] - left_in[index]).abs() < 1.0e-6);
+            assert!((right_out[index] - right_in[index]).abs() < 1.0e-6);
         }
+    }
+
+    #[test]
+    fn gain_effect_smooths_parameter_changes() {
+        let mut processor =
+            GainEffectProcessor::from_state(&ProcessorState::default()).expect("processor");
+        processor.set_param("gain_db", (-6.0 - MIN_GAIN_DB) / GAIN_RANGE_DB);
+
+        let input = [1.0; 8];
+        let mut output = [0.0; 8];
+        let mut right = [0.0; 8];
+        processor.process(&input, &input, &mut output, &mut right);
+
+        let target = knyst::db_to_amplitude(-6.0);
+        assert!(output[0] < 1.0);
+        assert!(output[0] > target);
+        assert!(output[7] < output[0]);
+        assert!(output[7] > target);
     }
 }

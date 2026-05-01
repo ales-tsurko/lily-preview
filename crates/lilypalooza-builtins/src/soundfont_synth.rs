@@ -7,7 +7,7 @@ use lilypalooza_audio::instrument::{
     Controller, ControllerError, EditorDescriptor, EditorError, EditorParent, EditorSession,
     EditorSize, InstrumentProcessor, InstrumentRuntimeContext, InstrumentRuntimeSpec, MidiEvent,
     ParameterDescriptor, Processor, ProcessorDescriptor, ProcessorState, ProcessorStateError,
-    RuntimeBinding, RuntimeFactoryError, SlotState,
+    RuntimeBinding, RuntimeFactoryError, SlotState, SmoothedAudioValue,
 };
 use lilypalooza_audio::soundfont::{SoundfontPreset, SoundfontSynthSettings};
 use lilypalooza_egui_baseview::{
@@ -150,6 +150,7 @@ pub(crate) struct SoundfontProcessor {
     applied_shared_revision: u32,
     needs_render: bool,
     silent_blocks: u32,
+    output_gain: SmoothedAudioValue,
 }
 
 #[derive(Debug, Clone)]
@@ -1731,8 +1732,9 @@ impl SoundfontProcessor {
         state: SoundfontProcessorState,
         shared_state: Option<SharedSoundfontState>,
     ) -> Result<Self, SoundfontSynthError> {
+        let initial_output_gain = state.output_gain;
         let mut synthesizer = build_synthesizer(soundfont, settings, &state)?;
-        synthesizer.set_master_volume(state.output_gain);
+        synthesizer.set_master_volume(1.0);
         let applied_shared_revision = shared_state
             .as_ref()
             .map_or(0, |shared| shared.snapshot().1);
@@ -1744,6 +1746,10 @@ impl SoundfontProcessor {
             applied_shared_revision,
             needs_render: false,
             silent_blocks: 0,
+            output_gain: SmoothedAudioValue::new(
+                initial_output_gain,
+                settings.sample_rate as usize,
+            ),
         };
         processor.apply_program();
         Ok(processor)
@@ -1771,7 +1777,8 @@ impl SoundfontProcessor {
             i32::from(self.state.program),
             0,
         );
-        self.synthesizer.set_master_volume(self.state.output_gain);
+        self.synthesizer.set_master_volume(1.0);
+        self.output_gain.set_target(self.state.output_gain);
         self.apply_effect_mix();
         self.needs_render = false;
         self.silent_blocks = 0;
@@ -1829,7 +1836,7 @@ impl SoundfontProcessor {
             return;
         }
         if gain_changed {
-            self.synthesizer.set_master_volume(self.state.output_gain);
+            self.output_gain.set_target(self.state.output_gain);
         }
         if mix_changed {
             self.apply_effect_mix();
@@ -1866,7 +1873,7 @@ impl Processor for SoundfontProcessor {
             }
             "output_gain" => {
                 self.state.output_gain = denormalize_output_gain(normalized);
-                self.synthesizer.set_master_volume(self.state.output_gain);
+                self.output_gain.set_target(self.state.output_gain);
                 true
             }
             "reverb_wet" => {
@@ -2009,6 +2016,12 @@ impl InstrumentProcessor for SoundfontProcessor {
             return;
         }
         self.synthesizer.render(left, right);
+        self.output_gain.set_target(self.state.output_gain);
+        for (left_sample, right_sample) in left.iter_mut().zip(right.iter_mut()) {
+            let gain = self.output_gain.next_sample();
+            *left_sample *= gain;
+            *right_sample *= gain;
+        }
         let peak = left
             .iter()
             .chain(right.iter())

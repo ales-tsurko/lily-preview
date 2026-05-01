@@ -23,6 +23,8 @@ use crate::soundfont::{LoadedSoundfont, SoundfontResource, SoundfontSynthSetting
 
 /// Built-in empty instrument id.
 pub const BUILTIN_NONE_ID: &str = "org.lilypalooza.none";
+/// Default smoothing time for host-owned audio controls.
+pub const DEFAULT_CONTROL_SMOOTHING_MS: f32 = 10.0;
 static NEXT_SLOT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_slot_instance_id() -> u64 {
@@ -44,6 +46,75 @@ fn reserve_slot_instance_id(instance_id: u64) {
         }
     }
 }
+
+/// One-pole low-pass smoother for audio-rate parameter targets.
+#[derive(Debug, Clone)]
+pub struct SmoothedAudioValue {
+    current: f32,
+    target: f32,
+    a: f32,
+    b: f32,
+}
+
+impl SmoothedAudioValue {
+    /// Creates a smoother initialized at `initial`.
+    #[must_use]
+    pub fn new(initial: f32, sample_rate: usize) -> Self {
+        let samples = (DEFAULT_CONTROL_SMOOTHING_MS * 0.001 * sample_rate.max(1) as f32).max(1.0);
+        let a = (-std::f32::consts::TAU / samples).exp();
+        Self {
+            current: initial,
+            target: initial,
+            a,
+            b: 1.0 - a,
+        }
+    }
+
+    /// Sets a new target value without jumping from the current value.
+    pub fn set_target(&mut self, target: f32) {
+        self.target = target;
+    }
+
+    /// Returns the next smoothed sample value.
+    pub fn next_sample(&mut self) -> f32 {
+        self.current = self.target * self.b + self.current * self.a;
+        self.current
+    }
+
+    /// Returns the current unsmoothed target.
+    #[must_use]
+    pub fn target(&self) -> f32 {
+        self.target
+    }
+}
+
+/// Thread-safe audio parameter target read by processor nodes.
+#[derive(Debug, Clone)]
+pub struct SharedAudioValue {
+    inner: Arc<AtomicU32>,
+}
+
+impl SharedAudioValue {
+    /// Creates a shared target initialized to `value`.
+    #[must_use]
+    pub fn new(value: f32) -> Self {
+        Self {
+            inner: Arc::new(AtomicU32::new(value.to_bits())),
+        }
+    }
+
+    /// Updates the target value.
+    pub fn set(&self, value: f32) {
+        self.inner.store(value.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Reads the current target value.
+    #[must_use]
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.inner.load(Ordering::Relaxed))
+    }
+}
+
 /// Built-in SoundFont instrument id.
 pub const BUILTIN_SOUNDFONT_ID: &str = "org.lilypalooza.soundfont";
 /// Built-in gain effect id.
@@ -595,6 +666,8 @@ impl Gen for InstrumentProcessorNode {
 /// Knyst node wrapper for any effect processor.
 pub(crate) struct EffectProcessorNode {
     processor: Box<dyn EffectProcessor>,
+    wet_target: SharedAudioValue,
+    wet: SmoothedAudioValue,
     scratch_left: Vec<Sample>,
     scratch_right: Vec<Sample>,
 }
@@ -602,9 +675,16 @@ pub(crate) struct EffectProcessorNode {
 #[impl_gen]
 impl EffectProcessorNode {
     #[new]
-    pub(crate) fn new(processor: Box<dyn EffectProcessor>) -> Self {
+    pub(crate) fn new(
+        processor: Box<dyn EffectProcessor>,
+        wet_target: SharedAudioValue,
+        sample_rate: usize,
+    ) -> Self {
+        let wet = SmoothedAudioValue::new(wet_target.get(), sample_rate);
         Self {
             processor,
+            wet_target,
+            wet,
             scratch_left: Vec::new(),
             scratch_right: Vec::new(),
         }
@@ -628,8 +708,13 @@ impl EffectProcessorNode {
             &mut self.scratch_left[..frames],
             &mut self.scratch_right[..frames],
         );
-        left_out[..frames].copy_from_slice(&self.scratch_left[..frames]);
-        right_out[..frames].copy_from_slice(&self.scratch_right[..frames]);
+        self.wet.set_target(self.wet_target.get());
+        for frame in 0..frames {
+            let wet = self.wet.next_sample();
+            let dry = 1.0 - wet;
+            left_out[frame] = left_in[frame] * dry + self.scratch_left[frame] * wet;
+            right_out[frame] = right_in[frame] * dry + self.scratch_right[frame] * wet;
+        }
         GenState::Continue
     }
 }
@@ -1005,7 +1090,7 @@ mod tests {
     use super::{
         BUILTIN_SOUNDFONT_ID, InstrumentProcessor, InstrumentProcessorNode,
         InstrumentRuntimeHandle, MidiEvent, Processor, ProcessorDescriptor, ProcessorState,
-        ProcessorStateError, SharedInstrumentResetState, SlotState,
+        ProcessorStateError, SharedInstrumentResetState, SlotState, SmoothedAudioValue,
     };
     use crate::instrument::registry::{self, Entry};
     use crate::test_utils::OfflineHarness;
@@ -1023,6 +1108,34 @@ mod tests {
         let mut state = vec![program];
         state.extend_from_slice(soundfont_id.as_bytes());
         SlotState::built_in(BUILTIN_SOUNDFONT_ID, ProcessorState(state))
+    }
+
+    #[test]
+    fn smoothed_audio_value_reaches_target_without_jump() {
+        let mut value = SmoothedAudioValue::new(0.0, 1_000);
+
+        value.set_target(1.0);
+
+        let first = value.next_sample();
+        assert!(first > 0.0);
+        assert!(first < 1.0);
+        for _ in 0..20 {
+            value.next_sample();
+        }
+        assert!(value.next_sample() > 0.99);
+    }
+
+    #[test]
+    fn smoothed_audio_value_continues_from_current_value_when_retargeted() {
+        let mut value = SmoothedAudioValue::new(0.0, 1_000);
+        value.set_target(1.0);
+        let before = value.next_sample();
+
+        value.set_target(0.5);
+        let after = value.next_sample();
+
+        assert!((after - before).abs() < 0.1);
+        assert!(after > before);
     }
 
     struct GateProcessor {

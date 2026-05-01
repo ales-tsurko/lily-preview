@@ -8,8 +8,8 @@ use crate::instrument::{
     Controller, EffectProcessorNode, EffectRuntimeContext, EffectRuntimeHandle,
     InstrumentProcessor, InstrumentProcessorNode, InstrumentRuntimeContext,
     InstrumentRuntimeHandle, ProcessorStateError, RuntimeBinding, RuntimeFactoryError,
-    ScheduledInstrumentEvent, SharedInstrumentResetState, SlotState,
-    create_effect_runtime as build_effect_runtime_spec,
+    ScheduledInstrumentEvent, SharedAudioValue, SharedInstrumentResetState, SlotState,
+    SmoothedAudioValue, create_effect_runtime as build_effect_runtime_spec,
     create_instrument_runtime as build_instrument_runtime_spec, decode_instrument_event,
     generation_is_current_or_newer, registry,
 };
@@ -829,6 +829,69 @@ impl MixerRuntime {
         Ok(())
     }
 
+    pub(crate) fn sync_all_send_levels(&self, mixer: &MixerState) {
+        for (track_id, track) in mixer.tracks_with_ids() {
+            if let Some(runtime) = self
+                .tracks
+                .get(track_id.index())
+                .and_then(|runtime| runtime.as_ref())
+            {
+                runtime.sync_send_levels(&track.routing.sends);
+            }
+        }
+        for (bus_id, bus) in mixer.buses_with_ids() {
+            if let Some(runtime) = self.buses.get(&bus_id) {
+                runtime.sync_send_levels(&bus.routing.sends);
+            }
+        }
+    }
+
+    pub(crate) fn sync_slot_bypass(
+        &self,
+        mixer: &MixerState,
+        address: SlotAddress,
+    ) -> Result<(), MixerRuntimeError> {
+        let Some(slot) = mixer.slot(address) else {
+            return Err(MixerError::InvalidSlotAddress {
+                strip_index: address.strip_index,
+                slot_index: address.slot_index,
+            }
+            .into());
+        };
+        let effect_index = address.slot_index.saturating_sub(1);
+        match address.strip_index {
+            0 => {
+                self.master.sync_effect_bypass(effect_index, slot.bypassed);
+            }
+            strip_index if strip_index <= mixer.track_count() => {
+                let track_id = TrackId((strip_index - 1) as u16);
+                let runtime = self
+                    .tracks
+                    .get(track_id.index())
+                    .ok_or(MixerError::InvalidTrackId(track_id))?;
+                if let Some(runtime) = runtime.as_ref() {
+                    runtime.sync_effect_bypass(effect_index, slot.bypassed);
+                }
+            }
+            _ => {
+                let Some(bus_id) = mixer
+                    .strip_by_index(address.strip_index)
+                    .and_then(|t| t.bus_id)
+                else {
+                    return Err(MixerError::InvalidSlotAddress {
+                        strip_index: address.strip_index,
+                        slot_index: address.slot_index,
+                    }
+                    .into());
+                };
+                if let Some(runtime) = self.buses.get(&bus_id) {
+                    runtime.sync_effect_bypass(effect_index, slot.bypassed);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn sync_all_routing_no_create(
         &mut self,
         commands: &mut MultiThreadedKnystCommands,
@@ -1099,7 +1162,7 @@ impl MasterRuntime {
         );
         let strip = handle_with_inputs(
             commands,
-            StereoBalanceMeter::new(level.clone(), meter.clone()),
+            StereoBalanceMeter::new(level.clone(), meter.clone(), settings.sample_rate),
             inputs!(),
         );
         let input = context.with_activation(|| {
@@ -1126,6 +1189,12 @@ impl MasterRuntime {
         self.level.set(gain, pan);
     }
 
+    fn sync_effect_bypass(&self, effect_index: usize, bypassed: bool) {
+        if let Some(Some(effect)) = self.effects.get(effect_index) {
+            effect.sync_bypass(bypassed);
+        }
+    }
+
     fn rebuild_effects(
         &mut self,
         context: &KnystContext,
@@ -1137,8 +1206,8 @@ impl MasterRuntime {
             disconnect_effect_chain(node_id_of(self.input), &self.effects);
             sync_effect_runtimes(&mut self.effects, track.effects(), settings);
             let mut previous = node_id_of(self.input);
-            for (effect, effect_slot) in self.effects.iter().zip(track.effect_states()) {
-                if let Some(effect) = effect.as_ref().filter(|_| !effect_slot.bypassed) {
+            for effect in &self.effects {
+                if let Some(effect) = effect.as_ref() {
                     let node = effect.node_id();
                     connect_stereo(previous, node);
                     previous = node;
@@ -1168,8 +1237,9 @@ struct TrackRuntime {
     route_bus: Handle<GenericHandle>,
     route_delay_node: Option<NodeId>,
     instrument: Option<TrackInstrumentRuntime>,
-    send_nodes: Vec<NodeId>,
+    sends: Vec<SendRuntime>,
     signal_path: TrackSignalPath,
+    sample_rate: usize,
 }
 
 struct TrackRuntimeBuildContext<'a> {
@@ -1237,10 +1307,49 @@ struct SendRouting<'a> {
     sends: &'a [BusSend],
     pre_source: LatentNode,
     post_source: LatentNode,
+    sample_rate: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SendTopology {
+    bus_id: BusId,
+    pre_fader: bool,
+}
+
+impl From<BusSend> for SendTopology {
+    fn from(send: BusSend) -> Self {
+        Self {
+            bus_id: send.bus_id,
+            pre_fader: send.pre_fader,
+        }
+    }
+}
+
+struct SendRuntime {
+    topology: SendTopology,
+    level: SharedAudioValue,
+    nodes: Vec<NodeId>,
+}
+
+impl SendRuntime {
+    fn set_send(&self, send: BusSend) {
+        let target = if send.enabled {
+            db_to_amplitude(send.gain_db)
+        } else {
+            0.0
+        };
+        self.level.set(target);
+    }
+
+    fn free(self) {
+        for node in self.nodes {
+            free_node(node);
+        }
+    }
 }
 
 impl TrackRuntime {
-    fn latencies(&self, track: &Track) -> StripLatency {
+    fn latencies(&self, _track: &Track) -> StripLatency {
         let instrument_latency = self
             .instrument
             .as_ref()
@@ -1248,9 +1357,7 @@ impl TrackRuntime {
         let effects_latency = self
             .effects
             .iter()
-            .zip(track.effect_states())
-            .filter(|(_, slot)| !slot.bypassed)
-            .filter_map(|(runtime, _)| runtime.as_ref())
+            .filter_map(|runtime| runtime.as_ref())
             .map(EffectRuntime::latency_samples)
             .sum::<u32>();
         let post_fader = instrument_latency.saturating_add(effects_latency);
@@ -1329,8 +1436,9 @@ impl TrackRuntime {
             route_bus,
             route_delay_node: None,
             instrument,
-            send_nodes: Vec::new(),
+            sends: Vec::new(),
             signal_path,
+            sample_rate: build.settings.sample_rate,
         };
         if !matches!(runtime.signal_path, TrackSignalPath::Combined) {
             runtime.rebuild_effects(context, commands, track, build.settings);
@@ -1426,6 +1534,12 @@ impl TrackRuntime {
             == track_prefers_combined_signal_path(track)
     }
 
+    fn sync_effect_bypass(&self, effect_index: usize, bypassed: bool) {
+        if let Some(Some(effect)) = self.effects.get(effect_index) {
+            effect.sync_bypass(bypassed);
+        }
+    }
+
     fn rebuild_effects(
         &mut self,
         context: &KnystContext,
@@ -1440,8 +1554,8 @@ impl TrackRuntime {
             disconnect_effect_chain(self.pre_send_source_node(), &self.effects);
             sync_effect_runtimes(&mut self.effects, track.effects(), settings);
             let mut previous = self.pre_send_source_node();
-            for (effect, effect_slot) in self.effects.iter().zip(track.effect_states()) {
-                if let Some(effect) = effect.as_ref().filter(|_| !effect_slot.bypassed) {
+            for effect in &self.effects {
+                if let Some(effect) = effect.as_ref() {
                     let node = effect.node_id();
                     connect_stereo(previous, node);
                     previous = node;
@@ -1481,6 +1595,7 @@ impl TrackRuntime {
                     node: self.post_send_source_node(),
                     latency: strip_latency.post_fader,
                 },
+                sample_rate: self.sample_rate,
             },
         );
         Ok(())
@@ -1515,39 +1630,58 @@ impl TrackRuntime {
         commands: &mut MultiThreadedKnystCommands,
         routing: SendRouting<'_>,
     ) {
-        for node in self.send_nodes.drain(..) {
-            free_node(node);
+        for send in self.sends.drain(..) {
+            send.free();
         }
 
         context.with_activation(|| {
             for send in routing.sends {
-                if !send.enabled {
-                    continue;
-                }
-                let Some(destination) = routing.bus_inputs.get(&send.bus_id).copied() else {
+                let topology = SendTopology::from(*send);
+                let Some(destination) = routing.bus_inputs.get(&topology.bus_id).copied() else {
                     continue;
                 };
+                let level = SharedAudioValue::new(if send.enabled {
+                    db_to_amplitude(send.gain_db)
+                } else {
+                    0.0
+                });
                 let gain = handle_with_inputs(
                     commands,
-                    StereoGain::new(),
-                    inputs!((2 : db_to_amplitude(send.gain_db))),
+                    StereoGain::new(level.clone(), routing.sample_rate),
+                    inputs!(),
                 );
                 let gain_node = node_id_of(gain);
-                let source = if send.pre_fader {
+                let source = if topology.pre_fader {
                     routing.pre_source
                 } else {
                     routing.post_source
                 };
                 connect_stereo(source.node, gain_node);
-                let delay = routing.pdc_plan.bus_send_delay(send.bus_id, source.latency);
+                let delay = routing
+                    .pdc_plan
+                    .bus_send_delay(topology.bus_id, source.latency);
+                let mut nodes = Vec::with_capacity(2);
                 if let Some(delay_node) =
                     connect_stereo_with_delay(commands, gain_node, destination, delay)
                 {
-                    self.send_nodes.push(delay_node);
+                    nodes.push(delay_node);
                 }
-                self.send_nodes.push(gain_node);
+                nodes.push(gain_node);
+                self.sends.push(SendRuntime {
+                    topology,
+                    level,
+                    nodes,
+                });
             }
         });
+    }
+
+    fn sync_send_levels(&self, sends: &[BusSend]) {
+        for (runtime, send) in self.sends.iter().zip(sends) {
+            if runtime.topology == SendTopology::from(*send) {
+                runtime.set_send(*send);
+            }
+        }
     }
 
     fn free(self) {
@@ -1557,8 +1691,8 @@ impl TrackRuntime {
         for effect in self.effects.into_iter().flatten() {
             free_effect(effect);
         }
-        for node in self.send_nodes {
-            free_node(node);
+        for send in self.sends {
+            send.free();
         }
         free_optional_node(self.route_delay_node);
         knyst_commands().disconnect(Connection::clear_from_nodes(node_id_of(self.route_bus)));
@@ -1633,6 +1767,7 @@ struct EffectRuntime {
     slot: SlotState,
     handle: EffectRuntimeHandle,
     binding: Option<Box<dyn RuntimeBinding>>,
+    wet: SharedAudioValue,
     processor_latency_samples: u32,
 }
 
@@ -1660,6 +1795,10 @@ impl EffectRuntime {
                     .max(self.processor_latency_samples)
             })
     }
+
+    fn sync_bypass(&self, bypassed: bool) {
+        self.wet.set(if bypassed { 0.0 } else { 1.0 });
+    }
 }
 
 fn create_effect_runtime(
@@ -1672,11 +1811,17 @@ fn create_effect_runtime(
     };
     let spec = build_effect_runtime_spec(effect, &context).ok()??;
     let processor_latency_samples = spec.processor.latency_samples();
-    let node = handle(EffectProcessorNode::new(spec.processor));
+    let wet = SharedAudioValue::new(if effect.bypassed { 0.0 } else { 1.0 });
+    let node = handle(EffectProcessorNode::new(
+        spec.processor,
+        wet.clone(),
+        settings.sample_rate,
+    ));
     Some(EffectRuntime {
         slot: effect.clone(),
         handle: EffectRuntimeHandle::new(node),
         binding: spec.binding,
+        wet,
         processor_latency_samples,
     })
 }
@@ -1697,6 +1842,7 @@ fn sync_effect_runtimes(
             })
             .and_then(|index| old_effects[index].take())
             .map(|mut effect| {
+                effect.sync_bypass(slot.bypassed);
                 effect.slot = slot.clone();
                 effect
             });
@@ -1734,17 +1880,16 @@ struct BusRuntime {
     level: SharedStripLevel,
     route_bus: Handle<GenericHandle>,
     route_delay_node: Option<NodeId>,
-    send_nodes: Vec<NodeId>,
+    sends: Vec<SendRuntime>,
+    sample_rate: usize,
 }
 
 impl BusRuntime {
-    fn latencies(&self, bus_track: &Track, input_latency: u32) -> StripLatency {
+    fn latencies(&self, _bus_track: &Track, input_latency: u32) -> StripLatency {
         let effects_latency = self
             .effects
             .iter()
-            .zip(bus_track.effect_states())
-            .filter(|(_, slot)| !slot.bypassed)
-            .filter_map(|(runtime, _)| runtime.as_ref())
+            .filter_map(|runtime| runtime.as_ref())
             .map(EffectRuntime::latency_samples)
             .sum::<u32>();
         let post_fader = input_latency.saturating_add(effects_latency);
@@ -1767,7 +1912,7 @@ impl BusRuntime {
         let level = SharedStripLevel::new(initial_gain, bus_track.state.pan);
         let strip = handle_with_inputs(
             commands,
-            StereoBalanceMeter::new(level.clone(), meter.clone()),
+            StereoBalanceMeter::new(level.clone(), meter.clone(), settings.sample_rate),
             inputs!(),
         );
         let (input, route_bus) = context.with_activation(|| {
@@ -1784,7 +1929,8 @@ impl BusRuntime {
             level,
             route_bus,
             route_delay_node: None,
-            send_nodes: Vec::new(),
+            sends: Vec::new(),
+            sample_rate: settings.sample_rate,
         };
         runtime.rebuild_effects(context, commands, bus_track, settings);
         runtime
@@ -1798,6 +1944,12 @@ impl BusRuntime {
         self.level.set(gain, bus_track.state.pan);
     }
 
+    fn sync_effect_bypass(&self, effect_index: usize, bypassed: bool) {
+        if let Some(Some(effect)) = self.effects.get(effect_index) {
+            effect.sync_bypass(bypassed);
+        }
+    }
+
     fn rebuild_effects(
         &mut self,
         context: &KnystContext,
@@ -1809,8 +1961,8 @@ impl BusRuntime {
             disconnect_effect_chain(node_id_of(self.input), &self.effects);
             sync_effect_runtimes(&mut self.effects, bus_track.effects(), settings);
             let mut previous = node_id_of(self.input);
-            for (effect, effect_slot) in self.effects.iter().zip(bus_track.effect_states()) {
-                if let Some(effect) = effect.as_ref().filter(|_| !effect_slot.bypassed) {
+            for effect in &self.effects {
+                if let Some(effect) = effect.as_ref() {
                     let node = effect.node_id();
                     connect_stereo(previous, node);
                     previous = node;
@@ -1849,6 +2001,7 @@ impl BusRuntime {
                     node: node_id_of(self.strip),
                     latency: strip_latency.post_fader,
                 },
+                sample_rate: self.sample_rate,
             },
         );
         Ok(())
@@ -1888,47 +2041,66 @@ impl BusRuntime {
         commands: &mut MultiThreadedKnystCommands,
         routing: SendRouting<'_>,
     ) {
-        for node in self.send_nodes.drain(..) {
-            free_node(node);
+        for send in self.sends.drain(..) {
+            send.free();
         }
 
         context.with_activation(|| {
             for send in routing.sends {
-                if !send.enabled {
-                    continue;
-                }
-                let Some(destination) = routing.bus_inputs.get(&send.bus_id).copied() else {
+                let topology = SendTopology::from(*send);
+                let Some(destination) = routing.bus_inputs.get(&topology.bus_id).copied() else {
                     continue;
                 };
+                let level = SharedAudioValue::new(if send.enabled {
+                    db_to_amplitude(send.gain_db)
+                } else {
+                    0.0
+                });
                 let gain = handle_with_inputs(
                     commands,
-                    StereoGain::new(),
-                    inputs!((2 : db_to_amplitude(send.gain_db))),
+                    StereoGain::new(level.clone(), routing.sample_rate),
+                    inputs!(),
                 );
                 let gain_node = node_id_of(gain);
-                let source = if send.pre_fader {
+                let source = if topology.pre_fader {
                     routing.pre_source
                 } else {
                     routing.post_source
                 };
                 connect_stereo(source.node, gain_node);
-                let delay = routing.pdc_plan.bus_send_delay(send.bus_id, source.latency);
+                let delay = routing
+                    .pdc_plan
+                    .bus_send_delay(topology.bus_id, source.latency);
+                let mut nodes = Vec::with_capacity(2);
                 if let Some(delay_node) =
                     connect_stereo_with_delay(commands, gain_node, destination, delay)
                 {
-                    self.send_nodes.push(delay_node);
+                    nodes.push(delay_node);
                 }
-                self.send_nodes.push(gain_node);
+                nodes.push(gain_node);
+                self.sends.push(SendRuntime {
+                    topology,
+                    level,
+                    nodes,
+                });
             }
         });
+    }
+
+    fn sync_send_levels(&self, sends: &[BusSend]) {
+        for (runtime, send) in self.sends.iter().zip(sends) {
+            if runtime.topology == SendTopology::from(*send) {
+                runtime.set_send(*send);
+            }
+        }
     }
 
     fn free(self) {
         for effect in self.effects.into_iter().flatten() {
             free_effect(effect);
         }
-        for node in self.send_nodes {
-            free_node(node);
+        for send in self.sends {
+            send.free();
         }
         free_optional_node(self.route_delay_node);
         knyst_commands().disconnect(Connection::clear_from_nodes(node_id_of(self.strip)));
@@ -1953,7 +2125,11 @@ fn create_track_strip(
     meter: SharedStripMeter,
     route_bus: Handle<GenericHandle>,
 ) -> Handle<GenericHandle> {
-    let strip = handle_with_inputs(commands, StereoBalanceMeter::new(level, meter), inputs!());
+    let strip = handle_with_inputs(
+        commands,
+        StereoBalanceMeter::new(level, meter.clone(), meter.sample_rate as usize),
+        inputs!(),
+    );
     connect_stereo(node_id_of(strip), node_id_of(route_bus));
     strip
 }
@@ -1990,6 +2166,7 @@ fn create_track_instrument(
                 reset_state.clone(),
                 level,
                 meter,
+                soundfont_settings.sample_rate as usize,
             ))
         } else {
             handle(InstrumentProcessorNode::new(processor, reset_state.clone()))
@@ -2254,13 +2431,19 @@ pub(super) fn process_stereo_balance_meter_simd(
     (peak_left, peak_right)
 }
 
-pub(super) struct StereoGain;
+pub(super) struct StereoGain {
+    level: SharedAudioValue,
+    gain: SmoothedAudioValue,
+}
 
 #[impl_gen]
 impl StereoGain {
     #[new]
-    fn new() -> Self {
-        Self
+    fn new(level: SharedAudioValue, sample_rate: usize) -> Self {
+        Self {
+            gain: SmoothedAudioValue::new(level.get(), sample_rate),
+            level,
+        }
     }
 
     #[process]
@@ -2269,13 +2452,13 @@ impl StereoGain {
         &mut self,
         left_in: &[Sample],
         right_in: &[Sample],
-        gain: &[Sample],
         left_out: &mut [Sample],
         right_out: &mut [Sample],
         block_size: BlockSize,
     ) -> GenState {
+        self.gain.set_target(self.level.get());
         for frame in 0..block_size.0 {
-            let gain = gain[frame];
+            let gain = self.gain.next_sample();
             left_out[frame] = left_in[frame] * gain;
             right_out[frame] = right_in[frame] * gain;
         }
@@ -2361,13 +2544,20 @@ impl StereoBalanceGain {
 struct StereoBalanceMeter {
     level: SharedStripLevel,
     meter: SharedStripMeter,
+    gain: SmoothedAudioValue,
+    pan: SmoothedAudioValue,
 }
 
 #[impl_gen]
 impl StereoBalanceMeter {
     #[new]
-    fn new(level: SharedStripLevel, meter: SharedStripMeter) -> Self {
-        Self { level, meter }
+    fn new(level: SharedStripLevel, meter: SharedStripMeter, sample_rate: usize) -> Self {
+        Self {
+            gain: SmoothedAudioValue::new(level.gain(), sample_rate),
+            pan: SmoothedAudioValue::new(level.pan(), sample_rate),
+            level,
+            meter,
+        }
     }
 
     #[process]
@@ -2379,21 +2569,22 @@ impl StereoBalanceMeter {
         right_out: &mut [Sample],
         block_size: BlockSize,
     ) -> GenState {
-        let gain = self.level.gain();
-        let pan = self.level.pan().clamp(-1.0, 1.0);
-        let left_gain = if pan > 0.0 { 1.0 - pan } else { 1.0 };
-        let right_gain = if pan < 0.0 { 1.0 + pan } else { 1.0 };
-        let left_mul = gain * left_gain;
-        let right_mul = gain * right_gain;
-        let (peak_left, peak_right) = process_stereo_balance_meter_simd(
-            left_in,
-            right_in,
-            left_out,
-            right_out,
-            left_mul,
-            right_mul,
-            block_size.0,
-        );
+        self.gain.set_target(self.level.gain());
+        self.pan.set_target(self.level.pan().clamp(-1.0, 1.0));
+        let mut peak_left = 0.0_f32;
+        let mut peak_right = 0.0_f32;
+        for frame in 0..block_size.0 {
+            let gain = self.gain.next_sample();
+            let pan = self.pan.next_sample().clamp(-1.0, 1.0);
+            let left_gain = if pan > 0.0 { 1.0 - pan } else { 1.0 };
+            let right_gain = if pan < 0.0 { 1.0 + pan } else { 1.0 };
+            let left = left_in[frame] * gain * left_gain;
+            let right = right_in[frame] * gain * right_gain;
+            left_out[frame] = left;
+            right_out[frame] = right;
+            peak_left = peak_left.max(left.abs());
+            peak_right = peak_right.max(right.abs());
+        }
 
         self.meter.observe_stereo(peak_left, peak_right);
         GenState::Continue
@@ -2408,6 +2599,8 @@ struct TrackInstrumentStripNode {
     scratch_right: Vec<Sample>,
     level: SharedStripLevel,
     meter: SharedStripMeter,
+    gain: SmoothedAudioValue,
+    pan: SmoothedAudioValue,
 }
 
 impl TrackInstrumentStripNode {
@@ -2416,6 +2609,7 @@ impl TrackInstrumentStripNode {
         reset_state: SharedInstrumentResetState,
         level: SharedStripLevel,
         meter: SharedStripMeter,
+        sample_rate: usize,
     ) -> Self {
         Self {
             active_generation: 0,
@@ -2423,6 +2617,8 @@ impl TrackInstrumentStripNode {
             processor,
             scratch_left: Vec::new(),
             scratch_right: Vec::new(),
+            gain: SmoothedAudioValue::new(level.gain(), sample_rate),
+            pan: SmoothedAudioValue::new(level.pan(), sample_rate),
             level,
             meter,
         }
@@ -2477,13 +2673,6 @@ impl knyst::r#gen::Gen for TrackInstrumentStripNode {
             &mut self.scratch_right[..frames],
         );
 
-        let gain = self.level.gain();
-        let pan = self.level.pan().clamp(-1.0, 1.0);
-        let left_gain = if pan > 0.0 { 1.0 - pan } else { 1.0 };
-        let right_gain = if pan < 0.0 { 1.0 + pan } else { 1.0 };
-        let left_mul = gain * left_gain;
-        let right_mul = gain * right_gain;
-
         let mut outputs = ctx.outputs.iter_mut();
         let Some(left_out) = outputs.next() else {
             return GenState::Continue;
@@ -2492,15 +2681,22 @@ impl knyst::r#gen::Gen for TrackInstrumentStripNode {
             return GenState::Continue;
         };
 
-        let (peak_left, peak_right) = process_stereo_balance_meter_simd(
-            &self.scratch_left[..frames],
-            &self.scratch_right[..frames],
-            left_out,
-            right_out,
-            left_mul,
-            right_mul,
-            frames,
-        );
+        self.gain.set_target(self.level.gain());
+        self.pan.set_target(self.level.pan().clamp(-1.0, 1.0));
+        let mut peak_left = 0.0_f32;
+        let mut peak_right = 0.0_f32;
+        for frame in 0..frames {
+            let gain = self.gain.next_sample();
+            let pan = self.pan.next_sample().clamp(-1.0, 1.0);
+            let left_gain = if pan > 0.0 { 1.0 - pan } else { 1.0 };
+            let right_gain = if pan < 0.0 { 1.0 + pan } else { 1.0 };
+            let left = self.scratch_left[frame] * gain * left_gain;
+            let right = self.scratch_right[frame] * gain * right_gain;
+            left_out[frame] = left;
+            right_out[frame] = right;
+            peak_left = peak_left.max(left.abs());
+            peak_right = peak_right.max(right.abs());
+        }
         self.meter.observe_stereo(peak_left, peak_right);
 
         if self.processor.is_sleeping() {
@@ -3361,7 +3557,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_track_send_does_not_create_runtime_send_node() {
+    fn disabled_track_send_creates_silent_runtime_send_node() {
         let mut harness = OfflineHarness::new(44_100, 64);
         let mut state = MixerState::new();
         state.set_soundfont(test_soundfont_resource());
@@ -3384,7 +3580,50 @@ mod tests {
         let track_runtime = mixer.runtime.tracks[0]
             .as_ref()
             .expect("track runtime should exist");
-        assert!(track_runtime.send_nodes.is_empty());
+        assert_eq!(track_runtime.sends.len(), 1);
+        assert_eq!(track_runtime.sends[0].level.get(), 0.0);
+    }
+
+    #[test]
+    fn effect_bypass_updates_wet_target_without_rebuilding_effect_node() {
+        let mut harness = OfflineHarness::new(44_100, 64);
+        let mut state = MixerState::new();
+        state.set_soundfont(test_soundfont_resource());
+        let track = state.track_mut(TrackId(0)).expect("track 0 should exist");
+        track.set_instrument_slot(soundfont_slot(0));
+        track.set_effects(vec![latency_effect_slot()]);
+        let context = harness.context().clone();
+        let settings = harness.settings();
+
+        let mut mixer = Mixer::new(&context, harness.commands(), &settings, state)
+            .expect("mixer should initialize");
+        let address = SlotAddress {
+            strip_index: 1,
+            slot_index: 1,
+        };
+        let effect = mixer.runtime.tracks[0]
+            .as_ref()
+            .and_then(|track| track.effects[0].as_ref())
+            .expect("effect runtime should exist");
+        let node = effect.node_id();
+        assert_eq!(effect.wet.get(), 1.0);
+
+        mixer
+            .state
+            .slot_mut(address)
+            .expect("slot should exist")
+            .bypassed = true;
+        mixer
+            .runtime
+            .sync_slot_bypass(&mixer.state, address)
+            .expect("bypass sync should succeed");
+
+        let effect = mixer.runtime.tracks[0]
+            .as_ref()
+            .and_then(|track| track.effects[0].as_ref())
+            .expect("effect runtime should still exist");
+        assert_eq!(effect.node_id(), node);
+        assert_eq!(effect.wet.get(), 0.0);
     }
 
     #[test]
