@@ -81,7 +81,7 @@ mod tests {
             "--format".to_string(),
             "vst2".to_string(),
             "--path".to_string(),
-            "/tmp/plugin".to_string(),
+            "plugin".to_string(),
         ])
         .expect_err("unknown format should fail");
 

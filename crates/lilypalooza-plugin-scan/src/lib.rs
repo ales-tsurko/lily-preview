@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::SystemTime;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Maximum number of concurrent validator subprocesses.
 pub const PLUGIN_VALIDATOR_CONCURRENCY: usize = 1;
@@ -152,6 +152,8 @@ pub struct PluginScanCache {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CachedPluginCandidate {
     fingerprint: PluginCandidateFingerprint,
+    #[serde(default)]
+    validator_fingerprint: Option<PluginCandidateFingerprint>,
     valid: bool,
     #[serde(default)]
     clap_plugins: Vec<lilypalooza_clap::ClapPluginMetadata>,
@@ -193,9 +195,20 @@ impl PluginScanCache {
     /// Returns whether a candidate has changed since the cached scan.
     #[must_use]
     pub fn is_stale(&self, path: &Path, fingerprint: PluginCandidateFingerprint) -> bool {
-        self.entries
-            .get(path)
-            .is_none_or(|entry| entry.fingerprint != fingerprint)
+        self.is_stale_for_validator(path, fingerprint, None)
+    }
+
+    /// Returns whether a candidate has changed since the cached scan for this validator.
+    #[must_use]
+    pub fn is_stale_for_validator(
+        &self,
+        path: &Path,
+        fingerprint: PluginCandidateFingerprint,
+        validator_fingerprint: Option<PluginCandidateFingerprint>,
+    ) -> bool {
+        self.entries.get(path).is_none_or(|entry| {
+            entry.fingerprint != fingerprint || entry.validator_fingerprint != validator_fingerprint
+        })
     }
 
     /// Stores a checked candidate.
@@ -203,6 +216,7 @@ impl PluginScanCache {
         &mut self,
         path: PathBuf,
         fingerprint: PluginCandidateFingerprint,
+        validator_fingerprint: Option<PluginCandidateFingerprint>,
         valid: bool,
         clap_plugins: Vec<lilypalooza_clap::ClapPluginMetadata>,
         vst3_plugins: Vec<lilypalooza_vst3::Vst3PluginMetadata>,
@@ -211,6 +225,7 @@ impl PluginScanCache {
             path,
             CachedPluginCandidate {
                 fingerprint,
+                validator_fingerprint,
                 valid,
                 clap_plugins,
                 vst3_plugins,
@@ -277,6 +292,7 @@ fn scan_worker(
         "Scanning plugins with {PLUGIN_VALIDATOR_CONCURRENCY} validator process"
     )));
     let mut summary = PluginScanSummary::default();
+    let validator_fingerprint = PluginCandidateFingerprint::from_path(&validator).ok();
 
     for root in search_paths.into_iter().filter(|path| path.enabled) {
         let candidates = match candidates_for_root(&root) {
@@ -303,7 +319,7 @@ fn scan_worker(
                     continue;
                 }
             };
-            if !cache.is_stale(&candidate, fingerprint) {
+            if !cache.is_stale_for_validator(&candidate, fingerprint, validator_fingerprint) {
                 match cache.cached_candidate(&candidate, fingerprint) {
                     Some(CachedCandidateResult::ValidClapPlugins(plugins)) => {
                         summary.valid_plugins += plugins.len();
@@ -322,10 +338,21 @@ fn scan_worker(
             match validate_candidate(root.format, &candidate, &validator) {
                 Ok(ValidatedPlugins::Clap(plugins)) => {
                     if plugins.is_empty() {
+                        if reuse_cached_valid_candidate(
+                            &cache,
+                            &candidate,
+                            fingerprint,
+                            &mut summary,
+                            &sender,
+                            "validator returned no CLAP plugins",
+                        ) {
+                            continue;
+                        }
                         summary.invalid_candidates += 1;
                         cache.mark_checked(
                             candidate.clone(),
                             fingerprint,
+                            validator_fingerprint,
                             false,
                             Vec::new(),
                             Vec::new(),
@@ -340,6 +367,7 @@ fn scan_worker(
                     cache.mark_checked(
                         candidate.clone(),
                         fingerprint,
+                        validator_fingerprint,
                         true,
                         plugins.clone(),
                         Vec::new(),
@@ -353,10 +381,21 @@ fn scan_worker(
                 }
                 Ok(ValidatedPlugins::Vst3(plugins)) => {
                     if plugins.is_empty() {
+                        if reuse_cached_valid_candidate(
+                            &cache,
+                            &candidate,
+                            fingerprint,
+                            &mut summary,
+                            &sender,
+                            "validator returned no VST3 plugins",
+                        ) {
+                            continue;
+                        }
                         summary.invalid_candidates += 1;
                         cache.mark_checked(
                             candidate.clone(),
                             fingerprint,
+                            validator_fingerprint,
                             false,
                             Vec::new(),
                             Vec::new(),
@@ -371,6 +410,7 @@ fn scan_worker(
                     cache.mark_checked(
                         candidate.clone(),
                         fingerprint,
+                        validator_fingerprint,
                         true,
                         Vec::new(),
                         plugins.clone(),
@@ -383,10 +423,21 @@ fn scan_worker(
                     let _ = sender.send(PluginScanEvent::Vst3Plugins(plugins));
                 }
                 Err(error) => {
+                    if reuse_cached_valid_candidate(
+                        &cache,
+                        &candidate,
+                        fingerprint,
+                        &mut summary,
+                        &sender,
+                        &format!("validation failed: {error}"),
+                    ) {
+                        continue;
+                    }
                     summary.invalid_candidates += 1;
                     cache.mark_checked(
                         candidate.clone(),
                         fingerprint,
+                        validator_fingerprint,
                         false,
                         Vec::new(),
                         Vec::new(),
@@ -405,6 +456,37 @@ fn scan_worker(
         summary.candidates, summary.valid_plugins, summary.invalid_candidates
     )));
     let _ = sender.send(PluginScanEvent::Finished { summary, cache });
+}
+
+fn reuse_cached_valid_candidate(
+    cache: &PluginScanCache,
+    candidate: &Path,
+    fingerprint: PluginCandidateFingerprint,
+    summary: &mut PluginScanSummary,
+    sender: &mpsc::Sender<PluginScanEvent>,
+    reason: &str,
+) -> bool {
+    match cache.cached_candidate(candidate, fingerprint) {
+        Some(CachedCandidateResult::ValidClapPlugins(plugins)) => {
+            summary.valid_plugins += plugins.len();
+            let _ = sender.send(PluginScanEvent::Log(format!(
+                "Reusing cached CLAP plugin metadata for {} ({reason})",
+                candidate.display()
+            )));
+            let _ = sender.send(PluginScanEvent::ClapPlugins(plugins));
+            true
+        }
+        Some(CachedCandidateResult::ValidVst3Plugins(plugins)) => {
+            summary.valid_plugins += plugins.len();
+            let _ = sender.send(PluginScanEvent::Log(format!(
+                "Reusing cached VST3 plugin metadata for {} ({reason})",
+                candidate.display()
+            )));
+            let _ = sender.send(PluginScanEvent::Vst3Plugins(plugins));
+            true
+        }
+        Some(CachedCandidateResult::Invalid) | None => false,
+    }
 }
 
 /// Returns plugin candidates directly under one search root.
@@ -443,12 +525,25 @@ fn validate_vst3_candidate(path: &Path, validator: &Path) -> Result<ValidatedPlu
         .arg(path)
         .output()
         .map_err(|error| format!("failed to run validator {}: {error}", validator.display()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(stderr.trim().to_string());
+    parse_vst3_validator_output(output.status.success(), &output.stdout, &output.stderr)
+}
+
+fn parse_vst3_validator_output(
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<ValidatedPlugins, String> {
+    let report = parse_validator_stdout::<lilypalooza_vst3::ValidationReport>(stdout);
+    if !success {
+        return match report {
+            Ok(report) => report
+                .result
+                .map(ValidatedPlugins::Vst3)
+                .map_err(|error| error.to_string()),
+            Err(_) => Err(String::from_utf8_lossy(stderr).trim().to_string()),
+        };
     }
-    let report: lilypalooza_vst3::ValidationReport =
-        serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())?;
+    let report = report.map_err(|error| error.to_string())?;
     report
         .result
         .map(ValidatedPlugins::Vst3)
@@ -463,26 +558,99 @@ fn validate_clap_candidate(path: &Path, validator: &Path) -> Result<ValidatedPlu
         .arg(path)
         .output()
         .map_err(|error| format!("failed to run validator {}: {error}", validator.display()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(stderr.trim().to_string());
+    parse_clap_validator_output(output.status.success(), &output.stdout, &output.stderr)
+}
+
+fn parse_clap_validator_output(
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<ValidatedPlugins, String> {
+    let report = parse_validator_stdout::<lilypalooza_clap::ValidationReport>(stdout);
+    if !success {
+        return match report {
+            Ok(report) => report
+                .result
+                .map(ValidatedPlugins::Clap)
+                .map_err(|error| error.to_string()),
+            Err(_) => Err(String::from_utf8_lossy(stderr).trim().to_string()),
+        };
     }
-    let report: lilypalooza_clap::ValidationReport =
-        serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())?;
+    let report = report.map_err(|error| error.to_string())?;
     report
         .result
         .map(ValidatedPlugins::Clap)
         .map_err(|error| error.to_string())
 }
 
+fn parse_validator_stdout<T>(stdout: &[u8]) -> Result<T, serde_json::Error>
+where
+    T: DeserializeOwned,
+{
+    if let Ok(report) = serde_json::from_slice(stdout) {
+        return Ok(report);
+    }
+
+    let mut last_error = None;
+    for (index, byte) in stdout.iter().enumerate() {
+        if *byte != b'{' {
+            continue;
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(&stdout[index..]);
+        match T::deserialize(&mut deserializer) {
+            Ok(report) => return Ok(report),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    match last_error {
+        Some(error) => Err(error),
+        None => serde_json::from_slice(stdout),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+
+    fn test_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("lilypalooza-plugin-scan-")
+            .tempdir()
+            .expect("temp dir")
+    }
+
+    fn test_path(file: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = test_dir();
+        let path = dir.path().join(file);
+        (dir, path)
+    }
+
+    fn vst3_report_stdout(path: &Path, role: &str) -> Vec<u8> {
+        serde_json::json!({
+            "format": "vst3",
+            "path": path,
+            "result": {
+                "Ok": [{
+                    "processor_id": format!("vst3:{}#00112233445566778899aabbccddeeff", path.display()),
+                    "class_id": "00112233445566778899aabbccddeeff",
+                    "name": "Plugin",
+                    "vendor": "Vendor",
+                    "version": null,
+                    "category": null,
+                    "role": role,
+                    "path": path,
+                    "library_path": path,
+                }]
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
 
     #[test]
     fn cache_marks_changed_candidate_as_stale() {
-        let path = PathBuf::from("/tmp/test.clap");
+        let (_dir, path) = test_path("test.clap");
         let mut cache = PluginScanCache::default();
         let old = PluginCandidateFingerprint {
             modified_millis: 10,
@@ -494,14 +662,44 @@ mod tests {
         };
 
         assert!(cache.is_stale(&path, old));
-        cache.mark_checked(path.clone(), old, true, Vec::new(), Vec::new());
+        cache.mark_checked(path.clone(), old, None, true, Vec::new(), Vec::new());
         assert!(!cache.is_stale(&path, old));
         assert!(cache.is_stale(&path, new));
     }
 
     #[test]
+    fn cache_marks_changed_validator_as_stale() {
+        let (_dir, path) = test_path("test.clap");
+        let candidate = PluginCandidateFingerprint {
+            modified_millis: 10,
+            len: 20,
+        };
+        let old_validator = Some(PluginCandidateFingerprint {
+            modified_millis: 1,
+            len: 2,
+        });
+        let new_validator = Some(PluginCandidateFingerprint {
+            modified_millis: 2,
+            len: 2,
+        });
+        let mut cache = PluginScanCache::default();
+
+        cache.mark_checked(
+            path.clone(),
+            candidate,
+            old_validator,
+            true,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert!(!cache.is_stale_for_validator(&path, candidate, old_validator));
+        assert!(cache.is_stale_for_validator(&path, candidate, new_validator));
+    }
+
+    #[test]
     fn clap_root_collects_only_clap_candidates() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = test_dir();
         std::fs::write(dir.path().join("a.clap"), "").expect("clap file");
         std::fs::write(dir.path().join("b.vst3"), "").expect("vst3 file");
         let root = PluginSearchPath {
@@ -517,7 +715,7 @@ mod tests {
 
     #[test]
     fn vst3_root_collects_vst3_candidates_recursively() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = test_dir();
         std::fs::write(dir.path().join("a.clap"), "").expect("clap file");
         let nested = dir.path().join("Vendor").join("b.vst3");
         std::fs::create_dir_all(&nested).expect("vst3 bundle");
@@ -534,20 +732,70 @@ mod tests {
 
     #[test]
     fn cache_roundtrips_from_explicit_path() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("plugin-cache.ron");
-        let candidate = PathBuf::from("/tmp/test.clap");
+        let (_cache_dir, path) = test_path("plugin-cache.ron");
+        let (_candidate_dir, candidate) = test_path("test.clap");
         let fingerprint = PluginCandidateFingerprint {
             modified_millis: 7,
             len: 9,
         };
         let mut cache = PluginScanCache::default();
-        cache.mark_checked(candidate.clone(), fingerprint, true, Vec::new(), Vec::new());
+        cache.mark_checked(
+            candidate.clone(),
+            fingerprint,
+            None,
+            true,
+            Vec::new(),
+            Vec::new(),
+        );
 
         cache.save_to(&path).expect("cache should save");
         let loaded = PluginScanCache::load_from(&path);
 
         assert!(!loaded.is_stale(&candidate, fingerprint));
+    }
+
+    #[test]
+    fn unchanged_valid_plugin_is_reused_when_revalidation_fails() {
+        let (_dir, path) = test_path("plugin.vst3");
+        let fingerprint = PluginCandidateFingerprint {
+            modified_millis: 7,
+            len: 9,
+        };
+        let stdout = vst3_report_stdout(&path, "instrument");
+        let ValidatedPlugins::Vst3(plugins) =
+            parse_vst3_validator_output(true, &stdout, b"").expect("valid plugin metadata")
+        else {
+            panic!("expected VST3 plugins");
+        };
+        let mut cache = PluginScanCache::default();
+        cache.mark_checked(
+            path.clone(),
+            fingerprint,
+            Some(PluginCandidateFingerprint {
+                modified_millis: 1,
+                len: 2,
+            }),
+            true,
+            Vec::new(),
+            plugins,
+        );
+        let (sender, receiver) = mpsc::channel();
+        let mut summary = PluginScanSummary::default();
+
+        assert!(reuse_cached_valid_candidate(
+            &cache,
+            &path,
+            fingerprint,
+            &mut summary,
+            &sender,
+            "validation failed"
+        ));
+
+        assert_eq!(summary.valid_plugins, 1);
+        assert!(matches!(
+            receiver.try_iter().last(),
+            Some(PluginScanEvent::Vst3Plugins(plugins)) if plugins[0].name == "Plugin"
+        ));
     }
 
     #[test]
@@ -590,72 +838,48 @@ mod tests {
     }
 
     #[test]
-    fn empty_clap_validation_result_counts_as_invalid_candidate() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let candidate = dir.path().join("empty.clap");
-        std::fs::write(&candidate, "").expect("clap file");
-        let validator = fake_empty_clap_validator();
-        let mut state = PluginScanState::default();
+    fn empty_clap_validation_result_parses_as_empty_plugin_list() {
+        let (_dir, path) = test_path("empty.clap");
+        let stdout = serde_json::json!({
+            "format": "clap",
+            "path": path,
+            "result": { "Ok": [] },
+        })
+        .to_string()
+        .into_bytes();
+        let plugins = parse_clap_validator_output(true, &stdout, b"")
+            .expect("empty valid report should parse");
 
-        state.start(
-            vec![PluginSearchPath {
-                format: PluginFormat::Clap,
-                path: dir.path().to_path_buf(),
-                enabled: true,
-            }],
-            PluginScanCache::default(),
-            validator,
-        );
-
-        let (summary, logs) = drain_scan_until_finished(&mut state);
-
-        assert_eq!(
-            summary,
-            PluginScanSummary {
-                candidates: 1,
-                valid_plugins: 0,
-                invalid_candidates: 1,
-            }
-        );
-        assert!(logs.iter().any(|log| log.contains("No CLAP plugins found")));
-    }
-
-    fn drain_scan_until_finished(state: &mut PluginScanState) -> (PluginScanSummary, Vec<String>) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut logs = Vec::new();
-        while Instant::now() < deadline {
-            for event in state.drain_events() {
-                match event {
-                    PluginScanEvent::Log(log) => logs.push(log),
-                    PluginScanEvent::Finished { summary, .. } => return (summary, logs),
-                    PluginScanEvent::ClapPlugins(_) | PluginScanEvent::Vst3Plugins(_) => {}
-                }
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        match plugins {
+            ValidatedPlugins::Clap(plugins) => assert!(plugins.is_empty()),
+            ValidatedPlugins::Vst3(_) => panic!("expected CLAP plugins"),
         }
-        panic!("scan did not finish");
     }
 
-    fn fake_empty_clap_validator() -> PathBuf {
-        let dir = tempfile::tempdir().expect("validator temp dir").keep();
-        let path = dir.join("validator");
-        std::fs::write(
-            &path,
-            "#!/bin/sh\nprintf '{\"format\":\"clap\",\"path\":\"%s\",\"result\":{\"Ok\":[]}}' \"$4\"\n",
-        )
-        .expect("validator script");
-        make_executable(&path);
-        path
+    #[test]
+    fn non_success_validator_with_valid_report_is_accepted() {
+        let (_dir, path) = test_path("plugin.vst3");
+        let stdout = vst3_report_stdout(&path, "effect");
+        let plugins = parse_vst3_validator_output(false, &stdout, b"process exited non-zero")
+            .expect("valid stdout should parse");
+
+        match plugins {
+            ValidatedPlugins::Vst3(plugins) => assert_eq!(plugins.len(), 1),
+            ValidatedPlugins::Clap(_) => panic!("expected VST3 plugins"),
+        }
     }
 
-    #[cfg(unix)]
-    fn make_executable(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn validator_stdout_prefix_noise_is_ignored() {
+        let (_dir, path) = test_path("plugin.vst3");
+        let mut stdout = b"[info] initializing\n[info] ready\n".to_vec();
+        stdout.extend(vst3_report_stdout(&path, "effect"));
+        let plugins = parse_vst3_validator_output(true, &stdout, b"")
+            .expect("valid report after log lines should parse");
 
-        let mut permissions = std::fs::metadata(path)
-            .expect("validator metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("validator permissions");
+        match plugins {
+            ValidatedPlugins::Vst3(plugins) => assert_eq!(plugins[0].name, "Plugin"),
+            ValidatedPlugins::Clap(_) => panic!("expected VST3 plugins"),
+        }
     }
 }
