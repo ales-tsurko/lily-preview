@@ -1,8 +1,9 @@
 //! VST3 plugin adapter.
 
 use std::collections::HashMap;
-use std::ffi::{c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
+use std::slice;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use lilypalooza_audio::instrument::{
@@ -223,9 +224,27 @@ fn vst3_factory_plugins(
 ) -> Vec<Vst3PluginMetadata> {
     // SAFETY: `factory` is a live COM factory kept alive by `LoadedModule`.
     let count = unsafe { factory.countClasses() }.max(0);
+    let factory_vendor = vst3_factory_vendor(factory);
     (0..count)
-        .filter_map(|index| vst3_class_metadata(factory, index, path, library_path))
+        .filter_map(|index| {
+            vst3_class_metadata(
+                factory,
+                index,
+                path,
+                library_path,
+                factory_vendor.as_deref(),
+            )
+        })
         .collect()
+}
+
+fn vst3_factory_vendor(factory: &ComPtr<IPluginFactory>) -> Option<String> {
+    let mut info = zeroed::<PFactoryInfo>();
+    // SAFETY: Factory fills the provided `PFactoryInfo`.
+    if unsafe { factory.getFactoryInfo(&mut info) } != kResultOk {
+        return None;
+    }
+    non_empty_string(c_char_array_to_string(&info.vendor))
 }
 
 fn vst3_class_metadata(
@@ -233,6 +252,7 @@ fn vst3_class_metadata(
     index: i32,
     path: &Path,
     library_path: &Path,
+    factory_vendor: Option<&str>,
 ) -> Option<Vst3PluginMetadata> {
     if let Some(factory2) = factory.cast::<IPluginFactory2>() {
         let mut info = zeroed::<PClassInfo2>();
@@ -240,7 +260,12 @@ fn vst3_class_metadata(
         if unsafe { factory2.getClassInfo2(index, &mut info) } == kResultOk
             && c_char_array_to_string(&info.category) == AUDIO_MODULE_CLASS
         {
-            return Some(metadata_from_class_info2(info, path, library_path));
+            return Some(metadata_from_class_info2(
+                info,
+                path,
+                library_path,
+                factory_vendor,
+            ));
         }
     }
 
@@ -251,13 +276,19 @@ fn vst3_class_metadata(
     {
         return None;
     }
-    Some(metadata_from_class_info(info, path, library_path))
+    Some(metadata_from_class_info(
+        info,
+        path,
+        library_path,
+        factory_vendor,
+    ))
 }
 
 fn metadata_from_class_info2(
     info: PClassInfo2,
     path: &Path,
     library_path: &Path,
+    factory_vendor: Option<&str>,
 ) -> Vst3PluginMetadata {
     let class_id = tuid_to_hex(&info.cid);
     let category = non_empty_string(c_char_array_to_string(&info.subCategories));
@@ -265,7 +296,10 @@ fn metadata_from_class_info2(
         processor_id: stable_processor_id(path, &class_id),
         class_id,
         name: c_char_array_to_string(&info.name),
-        vendor: non_empty_string(c_char_array_to_string(&info.vendor)),
+        vendor: metadata_vendor(
+            non_empty_string(c_char_array_to_string(&info.vendor)),
+            factory_vendor,
+        ),
         version: non_empty_string(c_char_array_to_string(&info.version)),
         role: role_from_subcategories(category.as_deref()),
         category,
@@ -278,19 +312,24 @@ fn metadata_from_class_info(
     info: PClassInfo,
     path: &Path,
     library_path: &Path,
+    factory_vendor: Option<&str>,
 ) -> Vst3PluginMetadata {
     let class_id = tuid_to_hex(&info.cid);
     Vst3PluginMetadata {
         processor_id: stable_processor_id(path, &class_id),
         class_id,
         name: c_char_array_to_string(&info.name),
-        vendor: None,
+        vendor: metadata_vendor(None, factory_vendor),
         version: None,
         category: None,
         role: registry::Role::Effect,
         path: path.to_path_buf(),
         library_path: library_path.to_path_buf(),
     }
+}
+
+fn metadata_vendor(class_vendor: Option<String>, factory_vendor: Option<&str>) -> Option<String> {
+    class_vendor.or_else(|| factory_vendor.map(str::to_owned))
 }
 
 fn role_from_subcategories(category: Option<&str>) -> registry::Role {
@@ -598,11 +637,283 @@ impl IHostApplicationTrait for Vst3Host {
 
     unsafe fn createInstance(
         &self,
-        _cid: *mut TUID,
-        _iid: *mut TUID,
-        _obj: *mut *mut c_void,
+        cid: *mut TUID,
+        iid: *mut TUID,
+        obj: *mut *mut c_void,
     ) -> tresult {
+        if obj.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: `obj` is a writable out pointer provided by the plugin.
+        unsafe {
+            *obj = std::ptr::null_mut();
+        }
+        // SAFETY: VST3 passes TUID pointers for `cid`/`iid`.
+        unsafe {
+            if tuid_ptr_eq(cid, &IMessage_iid) {
+                return create_host_message(iid, obj);
+            }
+            if tuid_ptr_eq(cid, &IAttributeList_iid) {
+                return create_host_attribute_list(iid, obj);
+            }
+        }
         kNotImplemented
+    }
+}
+
+unsafe fn create_host_message(iid: *mut TUID, obj: *mut *mut c_void) -> tresult {
+    // SAFETY: `iid` is supplied by VST3 and points to a TUID when non-null.
+    if unsafe { !tuid_ptr_eq(iid, &IMessage_iid) && !tuid_ptr_eq(iid, &FUnknown_iid) } {
+        return kNoInterface;
+    }
+    let Some(instance) = ComWrapper::new(Vst3Message::new()).to_com_ptr::<IMessage>() else {
+        return kNoInterface;
+    };
+    // SAFETY: `obj` was checked by the caller and receives ownership of the COM pointer.
+    unsafe {
+        *obj = instance.into_raw().cast();
+    }
+    kResultOk
+}
+
+unsafe fn create_host_attribute_list(iid: *mut TUID, obj: *mut *mut c_void) -> tresult {
+    // SAFETY: `iid` is supplied by VST3 and points to a TUID when non-null.
+    if unsafe { !tuid_ptr_eq(iid, &IAttributeList_iid) && !tuid_ptr_eq(iid, &FUnknown_iid) } {
+        return kNoInterface;
+    }
+    let Some(instance) =
+        ComWrapper::new(Vst3AttributeList::default()).to_com_ptr::<IAttributeList>()
+    else {
+        return kNoInterface;
+    };
+    // SAFETY: `obj` was checked by the caller and receives ownership of the COM pointer.
+    unsafe {
+        *obj = instance.into_raw().cast();
+    }
+    kResultOk
+}
+
+unsafe fn tuid_ptr_eq(value: *mut TUID, expected: &TUID) -> bool {
+    // SAFETY: Caller guarantees `value` is either null or a valid TUID pointer.
+    unsafe { value.as_ref().is_some_and(|value| value == expected) }
+}
+
+#[derive(Default)]
+struct Vst3AttributeList {
+    values: Mutex<HashMap<String, Vst3AttributeValue>>,
+}
+
+enum Vst3AttributeValue {
+    Int(i64),
+    Float(f64),
+    String(Vec<TChar>),
+    Binary(Vec<u8>),
+}
+
+impl Class for Vst3AttributeList {
+    type Interfaces = (IAttributeList,);
+}
+
+impl IAttributeListTrait for Vst3AttributeList {
+    unsafe fn setInt(&self, id: IAttrID, value: int64) -> tresult {
+        self.set_attr(id, Vst3AttributeValue::Int(value))
+    }
+
+    unsafe fn getInt(&self, id: IAttrID, value: *mut int64) -> tresult {
+        if value.is_null() {
+            return kInvalidArgument;
+        }
+        match self.get_attr(id) {
+            Some(Vst3AttributeValue::Int(stored)) => {
+                // SAFETY: `value` is checked non-null above.
+                unsafe {
+                    *value = stored;
+                }
+                kResultOk
+            }
+            _ => kResultFalse,
+        }
+    }
+
+    unsafe fn setFloat(&self, id: IAttrID, value: f64) -> tresult {
+        self.set_attr(id, Vst3AttributeValue::Float(value))
+    }
+
+    unsafe fn getFloat(&self, id: IAttrID, value: *mut f64) -> tresult {
+        if value.is_null() {
+            return kInvalidArgument;
+        }
+        match self.get_attr(id) {
+            Some(Vst3AttributeValue::Float(stored)) => {
+                // SAFETY: `value` is checked non-null above.
+                unsafe {
+                    *value = stored;
+                }
+                kResultOk
+            }
+            _ => kResultFalse,
+        }
+    }
+
+    unsafe fn setString(&self, id: IAttrID, string: *const TChar) -> tresult {
+        if string.is_null() {
+            return kInvalidArgument;
+        }
+        let mut stored = Vec::new();
+        let mut offset = 0;
+        loop {
+            // SAFETY: VST3 strings are null-terminated TChar arrays.
+            let ch = unsafe { *string.add(offset) };
+            stored.push(ch);
+            if ch == 0 {
+                break;
+            }
+            offset += 1;
+        }
+        self.set_attr(id, Vst3AttributeValue::String(stored))
+    }
+
+    unsafe fn getString(&self, id: IAttrID, string: *mut TChar, size_in_bytes: uint32) -> tresult {
+        if string.is_null() {
+            return kInvalidArgument;
+        }
+        let capacity = (size_in_bytes as usize) / std::mem::size_of::<TChar>();
+        if capacity == 0 {
+            return kInvalidArgument;
+        }
+        match self.get_attr(id) {
+            Some(Vst3AttributeValue::String(stored)) => {
+                let copy_len = stored.len().min(capacity);
+                // SAFETY: `string` points to `capacity` TChar slots by VST3 contract.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(stored.as_ptr(), string, copy_len);
+                    *string.add(copy_len.saturating_sub(1)) = 0;
+                }
+                kResultOk
+            }
+            _ => kResultFalse,
+        }
+    }
+
+    unsafe fn setBinary(&self, id: IAttrID, data: *const c_void, size_in_bytes: uint32) -> tresult {
+        if data.is_null() && size_in_bytes > 0 {
+            return kInvalidArgument;
+        }
+        // SAFETY: VST3 provides `size_in_bytes` readable bytes when non-zero.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size_in_bytes as usize) };
+        self.set_attr(id, Vst3AttributeValue::Binary(bytes.to_vec()))
+    }
+
+    unsafe fn getBinary(
+        &self,
+        id: IAttrID,
+        data: *mut *const c_void,
+        size_in_bytes: *mut uint32,
+    ) -> tresult {
+        if data.is_null() || size_in_bytes.is_null() {
+            return kInvalidArgument;
+        }
+        match self.get_attr(id) {
+            Some(Vst3AttributeValue::Binary(stored)) => {
+                // SAFETY: Out pointers are checked non-null above.
+                unsafe {
+                    *data = stored.as_ptr().cast();
+                    *size_in_bytes = stored.len() as uint32;
+                }
+                kResultOk
+            }
+            _ => kResultFalse,
+        }
+    }
+}
+
+impl Vst3AttributeList {
+    fn set_attr(&self, id: IAttrID, value: Vst3AttributeValue) -> tresult {
+        let Some(id) = attr_id_to_string(id) else {
+            return kInvalidArgument;
+        };
+        self.values
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, value);
+        kResultOk
+    }
+
+    fn get_attr(&self, id: IAttrID) -> Option<Vst3AttributeValue> {
+        let id = attr_id_to_string(id)?;
+        self.values
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .map(Vst3AttributeValue::clone_value)
+    }
+}
+
+impl Vst3AttributeValue {
+    fn clone_value(&self) -> Self {
+        match self {
+            Self::Int(value) => Self::Int(*value),
+            Self::Float(value) => Self::Float(*value),
+            Self::String(value) => Self::String(value.clone()),
+            Self::Binary(value) => Self::Binary(value.clone()),
+        }
+    }
+}
+
+fn attr_id_to_string(id: IAttrID) -> Option<String> {
+    if id.is_null() {
+        return None;
+    }
+    // SAFETY: VST3 AttrID is a null-terminated C string.
+    Some(unsafe { CStr::from_ptr(id) }.to_string_lossy().into_owned())
+}
+
+struct Vst3Message {
+    message_id: Mutex<Option<CString>>,
+    attributes: ComPtr<IAttributeList>,
+}
+
+impl Vst3Message {
+    fn new() -> Self {
+        let attributes = ComWrapper::new(Vst3AttributeList::default())
+            .to_com_ptr::<IAttributeList>()
+            .expect("Vst3AttributeList exposes IAttributeList");
+        Self {
+            message_id: Mutex::new(None),
+            attributes,
+        }
+    }
+}
+
+impl Class for Vst3Message {
+    type Interfaces = (IMessage,);
+}
+
+impl IMessageTrait for Vst3Message {
+    unsafe fn getMessageID(&self) -> FIDString {
+        self.message_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(std::ptr::null(), |id| id.as_ptr())
+    }
+
+    unsafe fn setMessageID(&self, id: FIDString) {
+        let message_id = if id.is_null() {
+            None
+        } else {
+            // SAFETY: VST3 message IDs are null-terminated C strings.
+            Some(unsafe { CStr::from_ptr(id) }.to_owned())
+        };
+        *self
+            .message_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = message_id;
+    }
+
+    unsafe fn getAttributes(&self) -> *mut IAttributeList {
+        self.attributes.as_ptr()
     }
 }
 
@@ -834,6 +1145,9 @@ impl Vst3RuntimeInner {
         let controller = created_controller.map(|created| created.controller);
         let (component_connection, controller_connection) =
             connect_component_and_controller(&component, controller.as_ref(), controller_lifecycle);
+        if let Some(controller) = &controller {
+            sync_controller_component_state(&component, controller);
+        }
 
         let mut runtime = Self {
             _module: module,
@@ -867,9 +1181,14 @@ impl Vst3RuntimeInner {
             let mut input = SpeakerArr::kStereo;
             let mut output = SpeakerArr::kStereo;
             let input_count = i32::from(role == registry::Role::Effect);
-            let _ = self
-                .processor
-                .setBusArrangements(&mut input, input_count, &mut output, 1);
+            let set_bus_arrangements_result =
+                self.processor
+                    .setBusArrangements(&mut input, input_count, &mut output, 1);
+            trace_vst3(|| {
+                format!(
+                    "configure_audio setBusArrangements done result={set_bus_arrangements_result} input_count={input_count}"
+                )
+            });
             trace_vst3(|| "configure_audio activate buses start".to_string());
             activate_buses(
                 &self.component,
@@ -894,20 +1213,35 @@ impl Vst3RuntimeInner {
                 sampleRate: sample_rate.max(1) as SampleRate,
             };
             trace_vst3(|| "configure_audio setupProcessing start".to_string());
-            if self.processor.setupProcessing(&mut setup) != kResultOk {
+            let setup_processing_result = self.processor.setupProcessing(&mut setup);
+            trace_vst3(|| {
+                format!("configure_audio setupProcessing done result={setup_processing_result}")
+            });
+            if setup_processing_result != kResultOk {
                 return Err(Vst3RuntimeError::SetupFailed);
             }
-            trace_vst3(|| "configure_audio setupProcessing done".to_string());
             trace_vst3(|| "configure_audio setActive(1) start".to_string());
-            if self.component.setActive(1) != kResultOk {
+            let set_active_result = self.component.setActive(1);
+            trace_vst3(|| format!("configure_audio setActive(1) done result={set_active_result}"));
+            if set_active_result != kResultOk {
                 return Err(Vst3RuntimeError::ActivateFailed);
             }
             self.active = true;
             trace_vst3(|| "configure_audio setProcessing(1) start".to_string());
-            if self.processor.setProcessing(1) != kResultOk {
+            let set_processing_result = self.processor.setProcessing(1);
+            trace_vst3(|| {
+                format!("configure_audio setProcessing(1) done result={set_processing_result}")
+            });
+            if set_processing_result == kResultOk {
+                self.processing = true;
+            } else if set_processing_result == kNotImplemented {
+                trace_vst3(|| {
+                    "configure_audio setProcessing(1) not implemented; continuing active"
+                        .to_string()
+                });
+            } else {
                 return Err(Vst3RuntimeError::ActivateFailed);
             }
-            self.processing = true;
             trace_vst3(|| "configure_audio done".to_string());
         }
         Ok(())
@@ -921,7 +1255,7 @@ impl Vst3RuntimeInner {
         output_right: &mut [f32],
         events: &[Event],
     ) -> bool {
-        if self.destroyed {
+        if self.destroyed || !self.processing {
             return false;
         }
         let frames = output_left.len().min(output_right.len());
@@ -1080,11 +1414,172 @@ fn connect_component_and_controller(
     {
         // SAFETY: Both connection points are live and owned by this runtime.
         unsafe {
+            trace_vst3(|| "connect_component_and_controller component.connect start".to_string());
             let _ = component_connection.connect(controller_connection.as_ptr());
+            trace_vst3(|| "connect_component_and_controller component.connect done".to_string());
+            trace_vst3(|| "connect_component_and_controller controller.connect start".to_string());
             let _ = controller_connection.connect(component_connection.as_ptr());
+            trace_vst3(|| "connect_component_and_controller controller.connect done".to_string());
         }
     }
     (component_connection, controller_connection)
+}
+
+fn sync_controller_component_state(
+    component: &ComPtr<IComponent>,
+    controller: &ComPtr<IEditController>,
+) {
+    let stream_wrapper = ComWrapper::new(Vst3MemoryStream::default());
+    let Some(stream) = stream_wrapper.to_com_ptr::<IBStream>() else {
+        return;
+    };
+    // SAFETY: Component/controller are initialized and the stream stays live for both calls.
+    unsafe {
+        trace_vst3(|| "sync_controller_component_state getState start".to_string());
+        if component.getState(stream.as_ptr()) != kResultOk {
+            trace_vst3(|| "sync_controller_component_state getState skipped".to_string());
+            return;
+        }
+        stream_wrapper.rewind();
+        trace_vst3(|| "sync_controller_component_state setComponentState start".to_string());
+        let result = controller.setComponentState(stream.as_ptr());
+        trace_vst3(|| {
+            format!("sync_controller_component_state setComponentState done result={result}")
+        });
+    }
+}
+
+#[derive(Default)]
+struct Vst3MemoryStream {
+    state: Mutex<Vst3MemoryStreamState>,
+}
+
+#[derive(Default)]
+struct Vst3MemoryStreamState {
+    data: Vec<u8>,
+    position: usize,
+}
+
+impl Vst3MemoryStream {
+    fn rewind(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .position = 0;
+    }
+}
+
+impl Class for Vst3MemoryStream {
+    type Interfaces = (IBStream,);
+}
+
+impl IBStreamTrait for Vst3MemoryStream {
+    unsafe fn read(
+        &self,
+        buffer: *mut c_void,
+        num_bytes: int32,
+        num_bytes_read: *mut int32,
+    ) -> tresult {
+        if num_bytes < 0 || buffer.is_null() {
+            return kInvalidArgument;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let requested = num_bytes as usize;
+        let available = state.data.len().saturating_sub(state.position);
+        let count = requested.min(available);
+        if count > 0 {
+            // SAFETY: `buffer` is non-null and writable for `count` bytes by IBStream contract.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    state.data.as_ptr().add(state.position),
+                    buffer.cast::<u8>(),
+                    count,
+                );
+            }
+        }
+        state.position += count;
+        // SAFETY: VST3 may pass null when it does not need the byte count.
+        if let Some(num_bytes_read) = unsafe { num_bytes_read.as_mut() } {
+            *num_bytes_read = count as int32;
+        }
+        kResultOk
+    }
+
+    unsafe fn write(
+        &self,
+        buffer: *mut c_void,
+        num_bytes: int32,
+        num_bytes_written: *mut int32,
+    ) -> tresult {
+        if num_bytes < 0 || buffer.is_null() {
+            return kInvalidArgument;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = num_bytes as usize;
+        let end = state.position.saturating_add(count);
+        if end > state.data.len() {
+            state.data.resize(end, 0);
+        }
+        // SAFETY: `buffer` is non-null and readable for `count` bytes by IBStream contract.
+        let input = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), count) };
+        let position = state.position;
+        state.data[position..end].copy_from_slice(input);
+        state.position = end;
+        // SAFETY: VST3 may pass null when it does not need the byte count.
+        if let Some(num_bytes_written) = unsafe { num_bytes_written.as_mut() } {
+            *num_bytes_written = count as int32;
+        }
+        kResultOk
+    }
+
+    unsafe fn seek(&self, pos: int64, mode: int32, result: *mut int64) -> tresult {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = match mode {
+            mode if mode == IBStream_::IStreamSeekMode_::kIBSeekSet as int32 => 0,
+            mode if mode == IBStream_::IStreamSeekMode_::kIBSeekCur as int32 => {
+                state.position as int64
+            }
+            mode if mode == IBStream_::IStreamSeekMode_::kIBSeekEnd as int32 => {
+                state.data.len() as int64
+            }
+            _ => return kInvalidArgument,
+        };
+        let Some(next) = base.checked_add(pos) else {
+            return kInvalidArgument;
+        };
+        if next < 0 {
+            return kInvalidArgument;
+        }
+        state.position = next as usize;
+        // SAFETY: VST3 may pass null when it does not need the new position.
+        if let Some(result) = unsafe { result.as_mut() } {
+            *result = next;
+        }
+        kResultOk
+    }
+
+    unsafe fn tell(&self, pos: *mut int64) -> tresult {
+        let position = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .position as int64;
+        // SAFETY: VST3 provides a writable position pointer or null.
+        let Some(pos) = (unsafe { pos.as_mut() }) else {
+            return kInvalidArgument;
+        };
+        *pos = position;
+        kResultOk
+    }
 }
 
 impl Drop for Vst3RuntimeInner {
@@ -1175,11 +1670,17 @@ fn set_controller_component_handler(
 fn activate_buses(component: &ComPtr<IComponent>, media_type: MediaType, direction: BusDirection) {
     // SAFETY: Component is live and queried with VST3 media/direction constants.
     let count = unsafe { component.getBusCount(media_type, direction) }.max(0);
+    trace_vst3(|| {
+        format!("activate_buses media_type={media_type} direction={direction} count={count}")
+    });
     for index in 0..count {
         // SAFETY: Bus indices are bounded by `getBusCount`.
-        unsafe {
-            let _ = component.activateBus(media_type, direction, index, 1);
-        }
+        let result = unsafe { component.activateBus(media_type, direction, index, 1) };
+        trace_vst3(|| {
+            format!(
+                "activate_buses media_type={media_type} direction={direction} index={index} result={result}"
+            )
+        });
     }
 }
 
@@ -1883,6 +2384,53 @@ mod tests {
     }
 
     #[test]
+    fn host_application_creates_vst3_messages() {
+        let host = Vst3Host::new();
+        let mut cid = IMessage_iid;
+        let mut iid = IMessage_iid;
+        let mut obj = std::ptr::null_mut();
+
+        // SAFETY: The test passes valid TUID pointers and a writable out pointer.
+        let result = unsafe { host.createInstance(&mut cid, &mut iid, &mut obj) };
+
+        assert_eq!(result, kResultOk);
+        // SAFETY: `createInstance` returned ownership of an IMessage pointer.
+        let message = unsafe { ComPtr::from_raw(obj.cast::<IMessage>()) }
+            .expect("host should create IMessage");
+        let id = CString::new("hello").expect("static string has no interior nul");
+        // SAFETY: The message pointer is live and `id` is a valid null-terminated string.
+        unsafe {
+            message.setMessageID(id.as_ptr());
+            assert_eq!(CStr::from_ptr(message.getMessageID()).to_bytes(), b"hello");
+            assert!(!message.getAttributes().is_null());
+        }
+    }
+
+    #[test]
+    fn host_application_creates_attribute_lists() {
+        let host = Vst3Host::new();
+        let mut cid = IAttributeList_iid;
+        let mut iid = IAttributeList_iid;
+        let mut obj = std::ptr::null_mut();
+
+        // SAFETY: The test passes valid TUID pointers and a writable out pointer.
+        let result = unsafe { host.createInstance(&mut cid, &mut iid, &mut obj) };
+
+        assert_eq!(result, kResultOk);
+        // SAFETY: `createInstance` returned ownership of an IAttributeList pointer.
+        let attributes = unsafe { ComPtr::from_raw(obj.cast::<IAttributeList>()) }
+            .expect("host should create IAttributeList");
+        let key = CString::new("value").expect("static string has no interior nul");
+        let mut value = 0;
+        // SAFETY: The attribute list pointer is live and `key` is null-terminated.
+        unsafe {
+            assert_eq!(attributes.setInt(key.as_ptr(), 42), kResultOk);
+            assert_eq!(attributes.getInt(key.as_ptr(), &mut value), kResultOk);
+        }
+        assert_eq!(value, 42);
+    }
+
+    #[test]
     fn vst3_candidate_paths_recurse() {
         let dir = tempfile::tempdir().expect("temp dir");
         let nested = dir.path().join("Vendor").join("Plugin.vst3");
@@ -1947,6 +2495,51 @@ mod tests {
     }
 
     #[test]
+    fn legacy_class_info_uses_factory_vendor() {
+        let mut info = zeroed::<PClassInfo>();
+        write_c_char_array(&mut info.name, "Legacy Plugin");
+
+        let metadata = metadata_from_class_info(
+            info,
+            Path::new("/Plug/Legacy.vst3"),
+            Path::new("/Plug/Legacy.vst3"),
+            Some("Factory Vendor"),
+        );
+
+        assert_eq!(metadata.name, "Legacy Plugin");
+        assert_eq!(metadata.vendor.as_deref(), Some("Factory Vendor"));
+    }
+
+    #[test]
+    fn class_info2_prefers_class_vendor_over_factory_vendor() {
+        let mut info = zeroed::<PClassInfo2>();
+        write_c_char_array(&mut info.vendor, "Class Vendor");
+
+        let metadata = metadata_from_class_info2(
+            info,
+            Path::new("/Plug/ClassVendor.vst3"),
+            Path::new("/Plug/ClassVendor.vst3"),
+            Some("Factory Vendor"),
+        );
+
+        assert_eq!(metadata.vendor.as_deref(), Some("Class Vendor"));
+    }
+
+    #[test]
+    fn class_info2_empty_vendor_uses_factory_vendor() {
+        let info = zeroed::<PClassInfo2>();
+
+        let metadata = metadata_from_class_info2(
+            info,
+            Path::new("/Plug/FactoryVendor.vst3"),
+            Path::new("/Plug/FactoryVendor.vst3"),
+            Some("Factory Vendor"),
+        );
+
+        assert_eq!(metadata.vendor.as_deref(), Some("Factory Vendor"));
+    }
+
+    #[test]
     fn component_integrated_controller_uses_component_lifecycle_only() {
         let lifecycle = ControllerLifecycle::ComponentIntegrated;
 
@@ -1956,7 +2549,7 @@ mod tests {
     }
 
     #[test]
-    fn separate_controller_uses_full_controller_lifecycle() {
+    fn separate_controller_uses_separate_controller_lifecycle() {
         let lifecycle = ControllerLifecycle::Separate;
 
         assert!(lifecycle.initializes_controller());
@@ -1968,6 +2561,12 @@ mod tests {
     fn tuid_hex_roundtrips() {
         let hex = "00112233445566778899aabbccddeeff";
         assert_eq!(tuid_to_hex(&hex_to_tuid(hex).expect("tuid")), hex);
+    }
+
+    fn write_c_char_array<const N: usize>(dst: &mut [c_char; N], value: &str) {
+        for (dst, src) in dst.iter_mut().zip(value.bytes().chain(std::iter::once(0))) {
+            *dst = src as c_char;
+        }
     }
 
     #[test]
